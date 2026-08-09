@@ -1,0 +1,52 @@
+{
+  "name": "storyprompt-desktop",
+  "version": "0.1.0",
+  "description": "StoryPrompt Desktop — AI Storytelling Prompt tool (Vilao AI pipeline)",
+  "main": "./out/main/index.js",
+  "private": true,
+  "scripts": {
+    "postinstall": "electron-rebuild -f -o better-sqlite3",
+    "predev": "electron-rebuild -f -o better-sqlite3",
+    "prestart": "electron-rebuild -f -o better-sqlite3",
+    "prebuild": "electron-rebuild -f -o better-sqlite3",
+    "dev": "electron-vite dev",
+    "build": "tsc --noEmit -p tsconfig.json && electron-vite build",
+    "start": "electron-vite preview",
+    "pretest": "npm rebuild better-sqlite3",
+    "test": "vitest run",
+    "lint": "eslint . --ext .ts,.tsx"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "^5.7.1",
+    "better-sqlite3": "^11.9.1",
+    "electron-store": "^8.2.0",
+    "lucide-react": "^0.474.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-hook-form": "^7.55.0",
+    "react-router-dom": "^6.28.2",
+    "zod": "^3.24.1",
+    "zustand": "^5.0.3"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.6.1",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@typescript-eslint/eslint-plugin": "^8.20.0",
+    "@typescript-eslint/parser": "^8.20.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "electron": "^33.3.1",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "eslint": "^8.57.1",
+    "eslint-plugin-react": "^7.37.4",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "postcss": "^8.5.1",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8"
+  }
+}
