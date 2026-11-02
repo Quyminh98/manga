@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { FileText, MousePointerClick, Trash2, Clipboard } from 'lucide-react'
-import { Button } from '@renderer/components/ui/Button'
 import { appApi } from '@renderer/lib/appApi'
 import { useProjectStore } from '@renderer/stores/useProjectStore'
 
-// spec.md 8.2 — Paste / Select all / Clear / Load .txt + character/word count.
-// Autosaves projects.transcript on change (spec.md 6.3), debounced so we
-// don't hit SQLite on every keystroke.
+// spec.md 8.2 — character/word count. Autosaves projects.transcript on
+// change (spec.md 6.3), debounced so we don't hit SQLite on every keystroke.
+//
+// Cập nhật (Phase 15, ngoài phạm vi V1 gốc): Paste/Select All/Clear/Load .txt
+// bị xoá theo yêu cầu trực tiếp của user (đã xác nhận lại, biết rõ hệ quả) —
+// Paste/Select All/Clear vẫn làm được bằng thao tác tay (Ctrl+V/Ctrl+A/xoá
+// text) trực tiếp trong textarea, không mất chức năng. Load .txt thì mất hẳn
+// — không còn cách nào khác trong app để nạp file .txt vào transcript của 1
+// project đã tồn tại.
 const AUTOSAVE_DEBOUNCE_MS = 800
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error'
@@ -17,8 +21,6 @@ export function TranscriptPage(): JSX.Element {
 
   const [transcript, setTranscript] = useState(currentProject?.transcript ?? '')
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle')
-  const [notice, setNotice] = useState<string | null>(null)
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout>>()
 
   // Re-sync only when the route's project id changes (not on every
@@ -64,34 +66,6 @@ export function TranscriptPage(): JSX.Element {
   const characterCount = transcript.length
   const wordCount = transcript.trim() === '' ? 0 : transcript.trim().split(/\s+/).length
 
-  const onPaste = async (): Promise<void> => {
-    setNotice(null)
-    try {
-      const text = await navigator.clipboard.readText()
-      updateTranscript(text)
-    } catch {
-      setNotice('Could not read the clipboard — paste directly into the editor (Cmd+V) instead.')
-    }
-  }
-
-  const onSelectAll = (): void => {
-    textareaRef.current?.select()
-  }
-
-  const onClear = (): void => {
-    updateTranscript('')
-  }
-
-  const onLoadFile = async (): Promise<void> => {
-    setNotice(null)
-    try {
-      const content = await appApi.projects.loadTranscriptFile()
-      if (content !== null) updateTranscript(content)
-    } catch {
-      setNotice('Could not load the selected file.')
-    }
-  }
-
   if (!projectId) {
     return <div />
   }
@@ -112,30 +86,8 @@ export function TranscriptPage(): JSX.Element {
             Paste plain text — no timestamps required.
           </p>
         </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
-          <span className="font-code-sm text-code-sm text-text-secondary w-16 text-right">
-            {SAVE_LABEL[saveStatus]}
-          </span>
-          <Button variant="ghost" type="button" onClick={() => void onPaste()}>
-            <Clipboard size={14} />
-            Paste
-          </Button>
-          <Button variant="ghost" type="button" onClick={onSelectAll}>
-            <MousePointerClick size={14} />
-            Select All
-          </Button>
-          <Button variant="ghost" type="button" onClick={onClear}>
-            <Trash2 size={14} />
-            Clear
-          </Button>
-          <Button variant="ghost" type="button" onClick={() => void onLoadFile()}>
-            <FileText size={14} />
-            Load .txt
-          </Button>
-        </div>
+        <span className="font-code-sm text-code-sm text-text-secondary flex-shrink-0">{SAVE_LABEL[saveStatus]}</span>
       </div>
-
-      {notice && <p className="mb-3 font-body-sm text-body-sm text-error">{notice}</p>}
 
       {/* DESIGN.md Components > Input Fields wants a focus indicator; this
           panel is one large input, so the whole border (not a left-accent —
@@ -152,7 +104,6 @@ export function TranscriptPage(): JSX.Element {
           </div>
         </div>
         <textarea
-          ref={textareaRef}
           value={transcript}
           onChange={(e) => updateTranscript(e.target.value)}
           placeholder="Paste plain transcript text — no timestamps required."

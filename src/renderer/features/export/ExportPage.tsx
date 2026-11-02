@@ -5,9 +5,15 @@ import { Button } from '@renderer/components/ui/Button'
 import { Card } from '@renderer/components/ui/Card'
 import { EmptyState } from '@renderer/components/ui/EmptyState'
 import { appApi } from '@renderer/lib/appApi'
-import { formatErrorForDisplay } from '@renderer/lib/errorDisplay'
 import { useProjectStore } from '@renderer/stores/useProjectStore'
-import { formatCharacterPromptsFile, formatImagePromptsFile, formatSrtFile, sanitizeProjectFolderName } from '@shared/exportFormat'
+import {
+  formatCharacterListFile,
+  formatCharacterPromptsFile,
+  formatImagePromptsFile,
+  formatSrtFile,
+  sanitizeFolderName
+} from '@shared/exportFormat'
+import { ProjectStatus } from '@shared/enums'
 import type { Character, CharacterPrompt, ScenePrompt, SrtBlock } from '@shared/entities'
 
 const PREVIEW_ENTRY_LIMIT = 3
@@ -63,29 +69,32 @@ export function ExportPage(): JSX.Element {
   const [characters, setCharacters] = useState<Character[]>([])
   const [characterPrompts, setCharacterPrompts] = useState<CharacterPrompt[]>([])
   const [scenePrompts, setScenePrompts] = useState<ScenePrompt[]>([])
-  const [isExporting, setIsExporting] = useState(false)
-  const [exportedFolderPath, setExportedFolderPath] = useState<string | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [exportFolderPath, setExportFolderPath] = useState<string | null>(null)
+  const [channelName, setChannelName] = useState<string | null>(null)
 
-  const refresh = useCallback(async (id: string) => {
-    const [blocks, characterList, promptList, sceneList] = await Promise.all([
+  const refresh = useCallback(async (id: string, channelId: string) => {
+    const [blocks, characterList, promptList, sceneList, folderPath, channel] = await Promise.all([
       appApi.srt.list(id),
       appApi.characters.list(id),
       appApi.characters.listPrompts(id),
-      appApi.scenePrompts.list(id)
+      appApi.scenePrompts.list(id),
+      appApi.export.getFolderPath(id),
+      appApi.channels.get(channelId)
     ])
     setSrtBlocks(blocks)
     setCharacters(characterList)
     setCharacterPrompts(promptList)
     setScenePrompts(sceneList)
+    setExportFolderPath(folderPath)
+    setChannelName(channel?.name ?? null)
   }, [])
 
   useEffect(() => {
     setSrtBlocks(null)
-    setExportedFolderPath(null)
-    setError(null)
-    if (projectId) void refresh(projectId)
-  }, [projectId, refresh])
+    setExportFolderPath(null)
+    setChannelName(null)
+    if (projectId && currentProject) void refresh(projectId, currentProject.channelId)
+  }, [projectId, currentProject, refresh])
 
   const charactersWithPrompts = useMemo(
     () => characters.filter((c) => !!characterPrompts.find((p) => p.characterId === c.characterId)?.prompt),
@@ -105,67 +114,44 @@ export function ExportPage(): JSX.Element {
     () => formatImagePromptsFile(scenePromptsWithContent.slice(0, PREVIEW_ENTRY_LIMIT)),
     [scenePromptsWithContent]
   )
-
-  const onExport = async (): Promise<void> => {
-    if (!projectId) return
-    setError(null)
-    setExportedFolderPath(null)
-    setIsExporting(true)
-    try {
-      const { folderPath } = await appApi.export.project(projectId)
-      setExportedFolderPath(folderPath)
-    } catch (err) {
-      // User dismissed the folder picker — not a failure, just reset silently.
-      // ipcRenderer wraps the thrown Main-process error as
-      // `Error invoking remote method '...': Error: EXPORT_CANCELED`, so this
-      // has to check .includes(), not equality, against the raw sentinel.
-      if (!(err instanceof Error) || !err.message.includes('EXPORT_CANCELED')) {
-        setError(err instanceof Error ? err.message : 'Export failed.')
-      }
-    } finally {
-      setIsExporting(false)
-    }
-  }
+  // Phase 24 — character_list.txt uses every detected character (not just
+  // those with a successful prompt), matching ExportService.export(), which
+  // also only writes this file at all when characters.length > 0.
+  const characterListPreview = useMemo(
+    () => formatCharacterListFile(characters.slice(0, PREVIEW_ENTRY_LIMIT)),
+    [characters]
+  )
 
   if (!currentProject || !projectId) {
     return <div />
   }
 
-  const folderName = sanitizeProjectFolderName(currentProject.name)
-  const exportBlockedReason = !srtBlocks || srtBlocks.length === 0 ? 'Split the transcript into SRT blocks first' : undefined
+  const channelFolderName = sanitizeFolderName(channelName ?? '', 'Untitled_Channel')
+  const folderName = sanitizeFolderName(currentProject.name, 'Untitled_Project')
+  const isExported =
+    !!exportFolderPath &&
+    (currentProject.status === ProjectStatus.COMPLETED || currentProject.status === ProjectStatus.COMPLETED_WITH_ERRORS)
 
   return (
     <div>
-      <div className="flex items-start justify-between gap-4 mb-8">
-        <div>
-          <h2 className="font-headline-lg text-headline-lg text-text-primary mb-2">Export</h2>
-          <p className="font-body-md text-body-md text-text-secondary">
-            Preview and export the .srt + character_prompts.txt + image_prompts.txt bundle.
-          </p>
-        </div>
-        <Button
-          variant="primary"
-          type="button"
-          onClick={() => void onExport()}
-          disabled={isExporting || !!exportBlockedReason}
-          title={exportBlockedReason}
-        >
-          <FolderOutput size={14} />
-          {isExporting ? 'Exporting…' : 'Export Project'}
-        </Button>
+      <div className="mb-8">
+        <h2 className="font-headline-lg text-headline-lg text-text-primary mb-2">Export</h2>
+        <p className="font-body-md text-body-md text-text-secondary">
+          Preview of the .srt + character_prompts.txt + image_prompts.txt bundle (plus character_list.txt for
+          projects with characters). Written automatically to your Default Export Folder (Settings &gt; General)
+          when Run All completes.
+        </p>
       </div>
 
-      {error && <p className="mb-4 font-body-sm text-body-sm text-error">{formatErrorForDisplay(error)}</p>}
-
-      {exportedFolderPath && (
+      {isExported && (
         <div className="mb-6 flex items-center justify-between gap-4 bg-emerald-success/10 border border-emerald-success/30 rounded-lg px-4 py-3">
           <div className="flex items-center gap-2 min-w-0">
             <CheckCircle2 size={16} className="text-emerald-success flex-shrink-0" />
             <p className="font-body-sm text-body-sm text-text-primary truncate">
-              Exported to <span className="font-code-sm text-code-sm">{exportedFolderPath}</span>
+              Exported to <span className="font-code-sm text-code-sm">{exportFolderPath}</span>
             </p>
           </div>
-          <Button variant="ghost" type="button" onClick={() => void appApi.export.showInFinder(exportedFolderPath)}>
+          <Button variant="ghost" type="button" onClick={() => void appApi.export.showInFinder(exportFolderPath)}>
             <FolderOpen size={14} />
             Show in Finder
           </Button>
@@ -185,19 +171,26 @@ export function ExportPage(): JSX.Element {
           <Card className="mb-6">
             <h3 className="font-headline-sm text-headline-sm text-text-primary mb-4">Output Folder</h3>
             <div className="font-code-sm text-code-sm text-text-secondary space-y-1.5">
-              <p className="text-text-primary">{folderName}/</p>
-              <p className="pl-4 flex items-center gap-2">
+              <p className="text-text-primary">{channelFolderName}/</p>
+              <p className="pl-4 text-text-primary">{folderName}/</p>
+              <p className="pl-8 flex items-center gap-2">
                 <Captions size={13} />
                 {folderName}.srt
               </p>
-              <p className="pl-4 flex items-center gap-2">
+              <p className="pl-8 flex items-center gap-2">
                 <Users size={13} />
                 character_prompts.txt
               </p>
-              <p className="pl-4 flex items-center gap-2">
+              <p className="pl-8 flex items-center gap-2">
                 <ImageIcon size={13} />
                 image_prompts.txt
               </p>
+              {characters.length > 0 && (
+                <p className="pl-8 flex items-center gap-2">
+                  <Users size={13} />
+                  character_list.txt
+                </p>
+              )}
             </div>
           </Card>
 
@@ -229,6 +222,17 @@ export function ExportPage(): JSX.Element {
                 totalEntries={scenePromptsWithContent.length}
               />
             </Card>
+            {characters.length > 0 && (
+              <Card>
+                <PreviewFile
+                  icon={Users}
+                  filename="character_list.txt"
+                  content={characterListPreview}
+                  shownEntries={Math.min(PREVIEW_ENTRY_LIMIT, characters.length)}
+                  totalEntries={characters.length}
+                />
+              </Card>
+            )}
           </div>
         </>
       )}

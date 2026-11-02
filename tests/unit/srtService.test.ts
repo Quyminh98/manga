@@ -19,7 +19,7 @@ describe('SrtService', () => {
   it('split() persists srt_blocks derived from the project transcript/settings', () => {
     const project = projectService.create(
       { name: 'Splitter test', transcript: 'First sentence here. Second sentence follows.' },
-      { maxCharacters: 25, fakeDurationSec: 4 }
+      { avgCharacters: 25, fakeDurationSec: 4 }
     )
 
     const result = srtService.split(project.id)
@@ -36,7 +36,7 @@ describe('SrtService', () => {
   })
 
   it('split() replaces the previous block set instead of appending', () => {
-    const project = projectService.create({ name: 'Re-split test', transcript: 'One. Two. Three.' }, { maxCharacters: 300, fakeDurationSec: 3 })
+    const project = projectService.create({ name: 'Re-split test', transcript: 'One. Two. Three.' }, { avgCharacters: 300, fakeDurationSec: 3 })
 
     const first = srtService.split(project.id)
     projectService.updateTranscript(project.id, 'A totally different transcript now.')

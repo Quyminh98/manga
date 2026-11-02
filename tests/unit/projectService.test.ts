@@ -21,10 +21,13 @@ describe('ProjectService', () => {
     expect(project.transcript).toBe('hello world')
     expect(project.status).toBe(ProjectStatus.DRAFT)
     expect(project.selectedModel).toBeNull()
-    expect(project.maxCharacters).toBe(300)
+    expect(project.avgCharacters).toBe(300)
+    expect(project.variancePercent).toBe(30)
     expect(project.fakeDurationSec).toBe(3)
-    expect(project.maxRetry).toBe(3)
+    expect(project.maxRetry).toBe(1)
     expect(project.sceneConcurrency).toBe(4)
+    expect(project.sceneBatchSize).toBe(10)
+    expect(project.hasCharacters).toBe(true)
     expect(project.id).toBeTruthy()
     expect(project.createdAt).toBe(project.updatedAt)
     expect(project.lastOpenedAt).toBeNull()
@@ -35,13 +38,62 @@ describe('ProjectService', () => {
   })
 
   it('creates a project using AppSettings defaults when provided', () => {
-    const project = service.create({ name: 'Custom defaults', transcript: '' }, { maxCharacters: 500, fakeDurationSec: 5 })
+    const project = service.create(
+      { name: 'Custom defaults', transcript: '' },
+      { avgCharacters: 500, variancePercent: 15, fakeDurationSec: 5 }
+    )
 
-    expect(project.maxCharacters).toBe(500)
+    expect(project.avgCharacters).toBe(500)
+    expect(project.variancePercent).toBe(15)
     expect(project.fakeDurationSec).toBe(5)
     // Unrelated schema defaults stay untouched by the override.
-    expect(project.maxRetry).toBe(3)
+    expect(project.maxRetry).toBe(1)
     expect(project.sceneConcurrency).toBe(4)
+    expect(project.sceneBatchSize).toBe(10)
+  })
+
+  // Phase 18 — every database (including a fresh createDatabase(':memory:'))
+  // always has the "Default" channel seeded by migration 0004_add_channels,
+  // so create() without an explicit channelId still succeeds and satisfies
+  // the channel_id foreign key.
+  it('falls back to the migration-seeded "Default" channel when channelId is omitted', () => {
+    const project = service.create({ name: 'No explicit channel', transcript: '' })
+
+    const channel = db.prepare('SELECT name FROM channels WHERE id = ?').get(project.channelId) as { name: string } | undefined
+    expect(channel?.name).toBe('Default')
+  })
+
+  it('uses the given channelId and copies its sceneConcurrency/sceneBatchSize defaults', () => {
+    const now = new Date().toISOString()
+    const channelId = randomUUID()
+    db.prepare(
+      `INSERT INTO channels (
+         id, name, avg_characters, variance_percent, fake_duration_sec, selected_model,
+         character_detection_prompt, character_generation_prompt, scene_generation_prompt,
+         scene_concurrency, scene_batch_size, created_at, updated_at
+       ) VALUES (?, 'Custom Channel', 800, 20, 6, 'gpt-5.5', 'd', 'g', 's', 2, 15, ?, ?)`
+    ).run(channelId, now, now)
+
+    const project = service.create(
+      { name: 'In custom channel', transcript: '', channelId },
+      { avgCharacters: 800, variancePercent: 20, fakeDurationSec: 6, sceneConcurrency: 2, sceneBatchSize: 15 }
+    )
+
+    expect(project.channelId).toBe(channelId)
+    expect(project.avgCharacters).toBe(800)
+    expect(project.variancePercent).toBe(20)
+    expect(project.fakeDurationSec).toBe(6)
+    expect(project.sceneConcurrency).toBe(2)
+    expect(project.sceneBatchSize).toBe(15)
+  })
+
+  it('copies hasCharacters=false from defaults (Phase 21 — "No Characters" channel)', () => {
+    const project = service.create({ name: 'No characters project', transcript: '' }, { hasCharacters: false })
+    expect(project.hasCharacters).toBe(false)
+  })
+
+  it('rejects an unknown channelId (foreign key enforced)', () => {
+    expect(() => service.create({ name: 'Bad channel', transcript: '', channelId: randomUUID() })).toThrow()
   })
 
   it('updateTranscript() persists the new transcript and bumps updated_at', async () => {
@@ -50,7 +102,7 @@ describe('ProjectService', () => {
 
     service.updateTranscript(created.id, 'new text')
 
-    const reopened = service.open(created.id)
+    const reopened = service.open(created.id, false)
     expect(reopened?.transcript).toBe('new text')
     expect(reopened && reopened.updatedAt > created.updatedAt).toBe(true)
   })
@@ -68,6 +120,7 @@ describe('ProjectService', () => {
     expect(summaries).toHaveLength(2)
     expect(summaries.map((p) => p.name).sort()).toEqual(['A', 'B'])
     for (const summary of summaries) {
+      expect(summary.channelName).toBe('Default')
       expect(summary.srtCount).toBe(0)
       expect(summary.characterCount).toBe(0)
       expect(summary.characterPromptDone).toBe(0)
@@ -129,7 +182,7 @@ describe('ProjectService', () => {
     const created = service.create({ name: 'Openable', transcript: '' })
     expect(created.lastOpenedAt).toBeNull()
 
-    const opened = service.open(created.id)
+    const opened = service.open(created.id, false)
 
     expect(opened).not.toBeNull()
     expect(opened?.id).toBe(created.id)
@@ -137,7 +190,7 @@ describe('ProjectService', () => {
   })
 
   it('open() returns null for an unknown id', () => {
-    expect(service.open(randomUUID())).toBeNull()
+    expect(service.open(randomUUID(), false)).toBeNull()
   })
 
   it('rename() persists the new name and updates updated_at', () => {
@@ -160,7 +213,7 @@ describe('ProjectService', () => {
     service.delete(created.id)
 
     expect(service.list()).toHaveLength(0)
-    expect(service.open(created.id)).toBeNull()
+    expect(service.open(created.id, false)).toBeNull()
   })
 
   it('delete() cascades to child tables (srt_blocks, characters, pipeline_tasks)', () => {
@@ -219,30 +272,45 @@ describe('ProjectService', () => {
     expect(service.get(project.id)?.status).toBe(ProjectStatus.PROCESSING)
   })
 
-  it('open() downgrades a stuck `processing` status to `paused` (crash/force-quit recovery)', () => {
+  it('open() downgrades a stuck `processing` status to `paused` when nothing is actually running it (crash/force-quit recovery)', () => {
     const project = service.create({ name: 'Stuck processing', transcript: '' })
     service.updateStatus(project.id, ProjectStatus.PROCESSING)
 
-    const reopened = service.open(project.id)
+    const reopened = service.open(project.id, false)
 
     expect(reopened?.status).toBe(ProjectStatus.PAUSED)
     expect(service.get(project.id)?.status).toBe(ProjectStatus.PAUSED)
   })
 
+  // Found via a live queue-run screenshot: opening a project (e.g. its
+  // Processing tab, router.tsx's projectLoader) while it's genuinely being
+  // run right now (queue-triggered or otherwise) must NOT clobber its real
+  // `processing` status back to `paused` — the caller is responsible for
+  // passing `PipelineService.isRunning(id)` in as `isActuallyRunning`.
+  it('open() does not downgrade `processing` when the caller says it is actually running', () => {
+    const project = service.create({ name: 'Genuinely running', transcript: '' })
+    service.updateStatus(project.id, ProjectStatus.PROCESSING)
+
+    const reopened = service.open(project.id, true)
+
+    expect(reopened?.status).toBe(ProjectStatus.PROCESSING)
+    expect(service.get(project.id)?.status).toBe(ProjectStatus.PROCESSING)
+  })
+
   it('open() leaves non-processing statuses untouched', () => {
     const project = service.create({ name: 'Draft stays draft', transcript: '' })
-    expect(service.open(project.id)?.status).toBe(ProjectStatus.DRAFT)
+    expect(service.open(project.id, false)?.status).toBe(ProjectStatus.DRAFT)
   })
 
   it('applyFirstRunSnapshotIfMissing sets every *_snapshot field exactly once (spec.md 32)', () => {
-    const project = service.create({ name: 'Snapshot', transcript: '' }, { maxCharacters: 250, fakeDurationSec: 4 })
+    const project = service.create({ name: 'Snapshot', transcript: '' }, { avgCharacters: 250, fakeDurationSec: 4 })
 
     const snapshot = {
       characterDetection: 'DETECT v1',
       characterGeneration: 'GENERATE v1',
       sceneGeneration: 'SCENE v1',
       model: 'gpt-4o',
-      maxCharacters: project.maxCharacters,
+      avgCharacters: project.avgCharacters,
       fakeDurationSec: project.fakeDurationSec
     }
     const first = service.applyFirstRunSnapshotIfMissing(project.id, snapshot)
@@ -251,7 +319,7 @@ describe('ProjectService', () => {
     expect(first.sceneGenerationPromptSnapshot).toBe('SCENE v1')
     expect(first.selectedModelSnapshot).toBe('gpt-4o')
     expect(first.selectedModel).toBe('gpt-4o')
-    expect(first.maxCharactersSnapshot).toBe(250)
+    expect(first.avgCharactersSnapshot).toBe(250)
     expect(first.fakeDurationSnapshot).toBe(4)
 
     // A second call (Resume) must not overwrite an existing snapshot.
@@ -259,15 +327,26 @@ describe('ProjectService', () => {
     expect(second.characterDetectionPromptSnapshot).toBe('DETECT v1')
   })
 
-  it('updatePipelineSettings writes maxRetry/sceneConcurrency to the project, validated to schema.md ranges', () => {
+  it('updatePipelineSettings writes maxRetry/sceneConcurrency/sceneBatchSize to the project, validated to schema.md ranges', () => {
     const project = service.create({ name: 'Pipeline tuning', transcript: '' })
-    service.updatePipelineSettings(project.id, { maxRetry: 5, sceneConcurrency: 4 })
+    service.updatePipelineSettings(project.id, { maxRetry: 5, sceneConcurrency: 4, sceneBatchSize: 15 })
 
     const updated = service.get(project.id)!
     expect(updated.maxRetry).toBe(5)
     expect(updated.sceneConcurrency).toBe(4)
+    expect(updated.sceneBatchSize).toBe(15)
 
-    expect(() => service.updatePipelineSettings(project.id, { maxRetry: 0, sceneConcurrency: 2 })).toThrow(/at least 1/)
-    expect(() => service.updatePipelineSettings(project.id, { maxRetry: 3, sceneConcurrency: 6 })).toThrow(/between 1 and 5/)
+    expect(() =>
+      service.updatePipelineSettings(project.id, { maxRetry: 0, sceneConcurrency: 2, sceneBatchSize: 10 })
+    ).toThrow(/at least 1/)
+    expect(() =>
+      service.updatePipelineSettings(project.id, { maxRetry: 3, sceneConcurrency: 11, sceneBatchSize: 10 })
+    ).toThrow(/between 1 and 10/)
+    expect(() =>
+      service.updatePipelineSettings(project.id, { maxRetry: 3, sceneConcurrency: 4, sceneBatchSize: 0 })
+    ).toThrow(/between 1 and 30/)
+    expect(() =>
+      service.updatePipelineSettings(project.id, { maxRetry: 3, sceneConcurrency: 4, sceneBatchSize: 31 })
+    ).toThrow(/between 1 and 30/)
   })
 })

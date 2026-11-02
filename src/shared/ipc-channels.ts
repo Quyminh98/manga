@@ -5,6 +5,7 @@ export const IpcChannels = {
   projects: {
     create: 'projects:create',
     open: 'projects:open',
+    get: 'projects:get',
     list: 'projects:list',
     rename: 'projects:rename',
     delete: 'projects:delete',
@@ -41,17 +42,40 @@ export const IpcChannels = {
   },
   settings: {
     get: 'settings:get',
-    save: 'settings:save'
+    save: 'settings:save',
+    chooseExportFolder: 'settings:chooseExportFolder'
   },
-  vilao: {
-    saveApiKey: 'vilao:saveApiKey',
-    testConnection: 'vilao:testConnection',
-    listModels: 'vilao:listModels',
-    hasApiKey: 'vilao:hasApiKey',
-    clearApiKey: 'vilao:clearApiKey'
+  llmCalls: {
+    stats: 'llmCalls:stats',
+    changedEvent: 'llmCalls:changedEvent'
+  },
+  providers: {
+    saveApiKey: 'providers:saveApiKey',
+    testConnection: 'providers:testConnection',
+    listModels: 'providers:listModels',
+    hasApiKey: 'providers:hasApiKey',
+    clearApiKey: 'providers:clearApiKey'
   },
   export: {
-    project: 'export:project',
+    getFolderPath: 'export:getFolderPath',
     showInFinder: 'export:showInFinder'
+  },
+  queue: {
+    add: 'queue:add',
+    remove: 'queue:remove',
+    list: 'queue:list',
+    updateEvent: 'queue:updateEvent'
+  },
+  channels: {
+    list: 'channels:list',
+    get: 'channels:get',
+    create: 'channels:create',
+    update: 'channels:update',
+    delete: 'channels:delete'
+  },
+  activation: {
+    getMachineId: 'activation:getMachineId',
+    getStatus: 'activation:getStatus',
+    activate: 'activation:activate'
   }
 } as const

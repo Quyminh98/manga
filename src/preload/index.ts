@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { IpcChannels } from '@shared/ipc-channels'
-import type { AppApi, ScenePromptGenerationProgress } from '@shared/ipc-types'
+import type { AppApi, QueueItem, ScenePromptGenerationProgress } from '@shared/ipc-types'
 import type { PipelineTask } from '@shared/entities'
 
 // contextIsolation: true, nodeIntegration: false (see src/main/index.ts webPreferences).
@@ -11,6 +11,7 @@ const appApi: AppApi = {
   projects: {
     create: (input) => ipcRenderer.invoke(IpcChannels.projects.create, input),
     open: (id) => ipcRenderer.invoke(IpcChannels.projects.open, id),
+    get: (id) => ipcRenderer.invoke(IpcChannels.projects.get, id),
     list: () => ipcRenderer.invoke(IpcChannels.projects.list),
     rename: (id, name) => ipcRenderer.invoke(IpcChannels.projects.rename, id, name),
     delete: (id) => ipcRenderer.invoke(IpcChannels.projects.delete, id),
@@ -55,18 +56,49 @@ const appApi: AppApi = {
   },
   settings: {
     get: () => ipcRenderer.invoke(IpcChannels.settings.get),
-    save: (settings) => ipcRenderer.invoke(IpcChannels.settings.save, settings)
+    save: (settings) => ipcRenderer.invoke(IpcChannels.settings.save, settings),
+    chooseExportFolder: () => ipcRenderer.invoke(IpcChannels.settings.chooseExportFolder)
   },
-  vilao: {
-    saveApiKey: (apiKey) => ipcRenderer.invoke(IpcChannels.vilao.saveApiKey, apiKey),
-    testConnection: () => ipcRenderer.invoke(IpcChannels.vilao.testConnection),
-    listModels: () => ipcRenderer.invoke(IpcChannels.vilao.listModels),
-    hasApiKey: () => ipcRenderer.invoke(IpcChannels.vilao.hasApiKey),
-    clearApiKey: () => ipcRenderer.invoke(IpcChannels.vilao.clearApiKey)
+  llmCalls: {
+    stats: (projectId) => ipcRenderer.invoke(IpcChannels.llmCalls.stats, projectId),
+    onChanged: (callback) => {
+      const listener = (_event: Electron.IpcRendererEvent, projectId: string): void => callback(projectId)
+      ipcRenderer.on(IpcChannels.llmCalls.changedEvent, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.llmCalls.changedEvent, listener)
+    }
+  },
+  providers: {
+    saveApiKey: (provider, apiKey) => ipcRenderer.invoke(IpcChannels.providers.saveApiKey, provider, apiKey),
+    testConnection: (provider) => ipcRenderer.invoke(IpcChannels.providers.testConnection, provider),
+    listModels: (provider) => ipcRenderer.invoke(IpcChannels.providers.listModels, provider),
+    hasApiKey: (provider) => ipcRenderer.invoke(IpcChannels.providers.hasApiKey, provider),
+    clearApiKey: (provider) => ipcRenderer.invoke(IpcChannels.providers.clearApiKey, provider)
   },
   export: {
-    project: (projectId) => ipcRenderer.invoke(IpcChannels.export.project, projectId),
+    getFolderPath: (projectId) => ipcRenderer.invoke(IpcChannels.export.getFolderPath, projectId),
     showInFinder: (folderPath) => ipcRenderer.invoke(IpcChannels.export.showInFinder, folderPath)
+  },
+  queue: {
+    add: (projectId) => ipcRenderer.invoke(IpcChannels.queue.add, projectId),
+    remove: (projectId) => ipcRenderer.invoke(IpcChannels.queue.remove, projectId),
+    list: () => ipcRenderer.invoke(IpcChannels.queue.list),
+    onUpdate: (callback) => {
+      const listener = (_event: Electron.IpcRendererEvent, items: QueueItem[]): void => callback(items)
+      ipcRenderer.on(IpcChannels.queue.updateEvent, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.queue.updateEvent, listener)
+    }
+  },
+  channels: {
+    list: () => ipcRenderer.invoke(IpcChannels.channels.list),
+    get: (id) => ipcRenderer.invoke(IpcChannels.channels.get, id),
+    create: (input) => ipcRenderer.invoke(IpcChannels.channels.create, input),
+    update: (id, input) => ipcRenderer.invoke(IpcChannels.channels.update, id, input),
+    delete: (id) => ipcRenderer.invoke(IpcChannels.channels.delete, id)
+  },
+  activation: {
+    getMachineId: () => ipcRenderer.invoke(IpcChannels.activation.getMachineId),
+    getStatus: () => ipcRenderer.invoke(IpcChannels.activation.getStatus),
+    activate: (code) => ipcRenderer.invoke(IpcChannels.activation.activate, code)
   }
 }
 

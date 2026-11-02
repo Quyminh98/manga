@@ -8,15 +8,20 @@ import { useProjectStore } from '@renderer/stores/useProjectStore'
 import { ProjectStatus } from '@shared/enums'
 import { pipelineSettingsSchema, type PipelineSettingsFormValues } from '@renderer/lib/validation/pipelineSettings.schema'
 
-// spec.md 33 — Max Retry (default 3) and Scene Generation concurrency
-// (default 2, range 1-5) live on `projects` (schema.md), not AppSettings —
-// there's no per-app default to edit here, only the currently open project's
-// own values (plan.md Phase 4 decided against adding a global maxRetry to
-// AppSettings, a schema change that wasn't needed at the time). This page
-// itself is global (routed under `/settings`, outside `/projects/:id`), so
-// it edits whichever project useProjectStore last loaded — the same project
-// TopBar's gear icon came from. Opening Settings without ever having opened
-// a project (e.g. from Home's sidebar) leaves nothing to edit.
+// spec.md 33 — Scene Generation concurrency (default 4, range 1-10) and Scene
+// Generation batch size (default 10, range 1-30, added 2026-08-10) live on
+// `projects` (schema.md), not AppSettings — there's no per-app default to
+// edit here, only the currently open project's own values. This page itself
+// is global (routed under `/settings`, outside `/projects/:id`), so it edits
+// whichever project useProjectStore last loaded — the same project TopBar's
+// gear icon came from. Opening Settings without ever having opened a project
+// (e.g. from Home's sidebar) leaves nothing to edit.
+//
+// Max Retry no longer has a control here (2026-08-10, user request) — every
+// project is fixed at ProjectService.DEFAULT_MAX_RETRY (1). The backend
+// (updatePipelineSettings, still requires all 3 fields in one call) is
+// untouched, so onSubmit passes the project's existing maxRetry through
+// unchanged alongside the edited sceneConcurrency/sceneBatchSize.
 export function AdvancedSettingsPage(): JSX.Element {
   const currentProject = useProjectStore((state) => state.currentProject)
   const [saveMessage, setSaveMessage] = useState<string | null>(null)
@@ -28,11 +33,13 @@ export function AdvancedSettingsPage(): JSX.Element {
     formState: { errors, isSubmitting, isDirty }
   } = useForm<PipelineSettingsFormValues>({
     resolver: zodResolver(pipelineSettingsSchema),
-    defaultValues: { maxRetry: 3, sceneConcurrency: 2 }
+    defaultValues: { sceneConcurrency: 4, sceneBatchSize: 10 }
   })
 
   useEffect(() => {
-    if (currentProject) reset({ maxRetry: currentProject.maxRetry, sceneConcurrency: currentProject.sceneConcurrency })
+    if (currentProject) {
+      reset({ sceneConcurrency: currentProject.sceneConcurrency, sceneBatchSize: currentProject.sceneBatchSize })
+    }
   }, [currentProject, reset])
 
   const isProcessing = currentProject?.status === ProjectStatus.PROCESSING
@@ -41,7 +48,11 @@ export function AdvancedSettingsPage(): JSX.Element {
   const onSubmit = handleSubmit(async (values) => {
     if (!currentProject) return
     setSaveMessage(null)
-    const updated = await appApi.projects.updatePipelineSettings(currentProject.id, values)
+    const updated = await appApi.projects.updatePipelineSettings(currentProject.id, {
+      maxRetry: currentProject.maxRetry,
+      sceneConcurrency: values.sceneConcurrency,
+      sceneBatchSize: values.sceneBatchSize
+    })
     useProjectStore.setState({ currentProject: updated })
     setSaveMessage('Saved.')
   })
@@ -57,17 +68,6 @@ export function AdvancedSettingsPage(): JSX.Element {
         </p>
         <form onSubmit={onSubmit} className="space-y-5">
           <div>
-            <label className="block font-label-caps text-label-caps text-text-secondary mb-2">MAX RETRY</label>
-            <input
-              {...register('maxRetry')}
-              disabled={disabled}
-              type="number"
-              className="w-full bg-surface-container-lowest border border-border-subtle rounded px-3 py-2 text-text-primary font-body-md text-body-md focus:outline-none focus:border-l-2 focus:border-l-vilao-blue disabled:opacity-60 disabled:cursor-not-allowed"
-            />
-            <p className="mt-1 font-body-sm text-body-sm text-text-secondary">Default 3. Retries per failing task/batch.</p>
-            {errors.maxRetry && <p className="mt-1 font-body-sm text-body-sm text-error">{errors.maxRetry.message}</p>}
-          </div>
-          <div>
             <label className="block font-label-caps text-label-caps text-text-secondary mb-2">
               SCENE GENERATION CONCURRENCY
             </label>
@@ -77,9 +77,26 @@ export function AdvancedSettingsPage(): JSX.Element {
               type="number"
               className="w-full bg-surface-container-lowest border border-border-subtle rounded px-3 py-2 text-text-primary font-body-md text-body-md focus:outline-none focus:border-l-2 focus:border-l-vilao-blue disabled:opacity-60 disabled:cursor-not-allowed"
             />
-            <p className="mt-1 font-body-sm text-body-sm text-text-secondary">Range 1–5. Default 2.</p>
+            <p className="mt-1 font-body-sm text-body-sm text-text-secondary">Range 1–10. Default 4.</p>
             {errors.sceneConcurrency && (
               <p className="mt-1 font-body-sm text-body-sm text-error">{errors.sceneConcurrency.message}</p>
+            )}
+          </div>
+          <div>
+            <label className="block font-label-caps text-label-caps text-text-secondary mb-2">
+              SCENE GENERATION BATCH SIZE
+            </label>
+            <input
+              {...register('sceneBatchSize')}
+              disabled={disabled}
+              type="number"
+              className="w-full bg-surface-container-lowest border border-border-subtle rounded px-3 py-2 text-text-primary font-body-md text-body-md focus:outline-none focus:border-l-2 focus:border-l-vilao-blue disabled:opacity-60 disabled:cursor-not-allowed"
+            />
+            <p className="mt-1 font-body-sm text-body-sm text-text-secondary">
+              Range 1–30. Default 10. Number of SRT blocks grouped into each Image Prompt request.
+            </p>
+            {errors.sceneBatchSize && (
+              <p className="mt-1 font-body-sm text-body-sm text-error">{errors.sceneBatchSize.message}</p>
             )}
           </div>
           {isProcessing && (

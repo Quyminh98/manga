@@ -23,7 +23,7 @@ export class SrtService {
     if (!project) throw new Error(`Project not found: ${projectId}`)
 
     const now = new Date().toISOString()
-    const parts = splitTranscriptToSrtBlocks(project.transcript, project.maxCharacters, project.fakeDurationSec)
+    const parts = splitTranscriptToSrtBlocks(project.transcript, project.avgCharacters, project.variancePercent, project.fakeDurationSec)
     const blocks: SrtBlock[] = parts.map((part) => ({
       id: randomUUID(),
       projectId,

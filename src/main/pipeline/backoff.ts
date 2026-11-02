@@ -1,5 +1,5 @@
 // spec.md 33 — "Nếu API trả rate limit: giảm tốc, retry theo backoff."
-// Exponential backoff shared by every retry loop that calls VilaoService.
+// Exponential backoff shared by every retry loop that calls LlmClient.
 export const RATE_LIMIT_BASE_DELAY_MS = 1000
 export const RATE_LIMIT_MAX_DELAY_MS = 30000
 

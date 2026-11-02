@@ -17,6 +17,22 @@ Nguồn: [spec.md](spec.md) · [schema.md](schema.md) · [../.stitch/DESIGN.md](
 - [x] Phase 11: Export
 - [x] Phase 12: Regenerate + Error Handling Polish
 - [x] Phase 13: Polish — Responsive, Animation, Edge Cases
+- [x] Phase 14: Post-V1 — dọn UI thừa (Run All đã đủ) + Run Queue nhiều project + Delete-while-running
+- [x] Phase 15: Post-V1 — đồng bộ Queue/Dashboard, xoá Resume, chuẩn hoá format prompt, đóng gói Windows
+- [x] Phase 16: Post-V1 — Overview tab cập nhật real-time, hạ Max Retry mặc định (bỏ UI), thêm setting Scene Generation Batch Size
+- [x] Phase 17: Post-V1 — Channels (setting riêng theo channel, project dùng setting của channel nó thuộc về)
+- [x] Phase 18: Post-V1 — Average Characters per SRT + Variance % (thay cho Max cứng)
+- [x] Phase 19: Post-V1 — Export folder nested under Channel name
+- [x] Phase 20: Post-V1 — Processing tab real-time fix (queue-triggered run) + bỏ nút Remove khỏi Queue
+- [x] Phase 21: Post-V1 — Channel option "No Characters" (bỏ qua Character Detection/Character Prompt Generation cho transcript không có nhân vật/cốt truyện)
+- [x] Phase 22: Post-V1 — Prompt Scene/Image Generation riêng cho channel "No Characters" (không nhắc tới nhân vật, không cần Relevant Character Selector)
+- [x] Phase 23: Post-V1 — Activation Code (khoá theo máy, offline, ký bằng Ed25519 gắn Machine ID)
+- [x] Phase 24: Post-V1 — Export thêm `character_list.txt` (danh sách Character ID, chỉ khi project có nhân vật)
+- [x] Phase 25: Post-V1 — Multi-provider API key (thêm DeepSeek + Gemini bên cạnh Vilao)
+- [x] Phase 26: Post-V1 — Thinking level theo channel cho DeepSeek/Gemini
+- [x] Phase 27: Post-V1 — Tab "API Calls" theo project (đếm số lần gọi model)
+- [x] Phase 28: Post-V1 — Tối ưu gọi API (retry lỗi tạm thời, streaming + idle timeout, thinking Off cho bước chọn nhân vật, prefix caching, JSON mode, song song Character Prompts)
+- [x] Phase 29: Post-V1 — Dọn cấu trúc source (LlmClient, composition root, BatchContext) + sửa lỗi thao tác thủ công (prompt No Characters, snapshot, chạy chồng Run All)
 
 > Cập nhật `[ ]` → `[x]` khi giai đoạn hoàn thành và đã được xác nhận. Không tick trước khi test pass.
 
@@ -441,6 +457,14 @@ Quy trình bắt buộc cho **mọi** phase có UI: `list_screens` (đã có s�
 - **Cập nhật lại toàn bộ test phụ thuộc số liệu batch/concurrency cũ** — nhiều test dựng kịch bản dựa trên đúng ranh giới batch 20 (ví dụ "21 blocks → batch 1-20 + batch 21 alone", "40 blocks → 2 batch × 20, concurrency 2 chạy song song") phải tính lại theo batch 10/concurrency 4 (`tests/unit/generateScenePrompt.test.ts`: `chunkSrtBlocks` default batch size; `tests/unit/projectService.test.ts`: 2 assertion `sceneConcurrency`; `tests/unit/scenePromptService.test.ts`: 6 test — ranh giới batch/neighbor, số lần gọi `chat()` khi resume/skip, số batch chạy đồng thời, tiến trình `onProgress` theo 3 batch thay vì 2, kịch bản Pause giữa chừng với 5 batch/4 song song). Tổng `vitest` 192/192 pass (không đổi số lượng test, chỉ đổi số liệu kỳ vọng), `tsc`/`eslint`/`npm run build` sạch.
 - Chưa có bằng chứng end-to-end với API thật cho riêng thay đổi này — cùng cần xác nhận cùng lúc với bản đổi JSON ở trên khi user Retry Failed/Run All lại.
 
+**Tối ưu cost/latency cho project nhiều SRT (2026-08-10, theo yêu cầu user — project ~900 Image Prompt tốn token/thời gian):** phân tích cho thấy Scene Generation chính đã batch (10 SRT/request, ~90 request cho 900 block) nhưng **Internal Relevant Character Selector** (mục 31) vẫn chạy per-SRT — mỗi block local match trượt (thường là câu chỉ có đại từ) tốn thêm 1 request LLM riêng, lên tới ~900 request phụ trong trường hợp xấu nhất. 2 thay đổi cộng dồn, cả 2 đều đã trình bày plan + được user duyệt trước khi làm:
+- **Batch hoá selector call theo đúng batch của Scene Generation** — mọi SRT trong 1 batch còn cần selector giờ gộp vào đúng 1 request (thay vì 1 request/block), cùng dạng response "keyed theo `block_number`" mà Scene Generation đã dùng. `buildRelevantCharacterSelectorMessages()`/`parseRelevantCharacterSelectorResponse()` (single-item) bị xoá hẳn, thay bằng `buildBatchRelevantCharacterSelectorMessages()`/`parseBatchRelevantCharacterSelectorResponse()` (`selectRelevantCharacters.ts`). Parse lenient hơn bản cũ: 1 block thiếu trong response chỉ nhận `[]`, không throw/retry cả batch — chỉ throw khi JSON hỏng hoàn toàn ở cấp cao nhất (trigger retry đúng 1 lần cho cả nhóm, không phải per-block như trước).
+- **Local pronoun carry-forward** — hàm mới `resolveLocalRelevantCharacterIds(blocks, characters)` chạy 1 lần, tuần tự, thuần string (không LLM) trên toàn bộ `srt_blocks` trước khi batch/concurrency bắt đầu: block khớp tên trực tiếp (`matchLocalRelevantCharacterIds`, không đổi) trở thành "last known"; block sau đó không khớp tên nhưng có đại từ ngôi 3 (`containsPronounHint()`, danh sách ngắn song ngữ VI/EN) kế thừa "last known" thay vì phải gọi selector. `ScenePromptService.generate()`/`retry()` gọi hàm này 1 lần, truyền map kết quả xuống `generateBatch()` (tham số mới `localSelectionByBlockIndex`) — chỉ những block map trả về `[]` mới vào nhóm gọi selector batch ở trên.
+- Không đổi field/schema nào (đã xác nhận trong plan trước khi làm) — `scene_prompts.relevant_character_ids` vẫn cùng ý nghĩa, chỉ đổi *cách* nó được tính. Fallback cuối mục 31 (selector lỗi hết `max_retry` → compact index toàn bộ, không Character Reference) không đổi hành vi, chỉ đổi phạm vi áp dụng (cả nhóm cần selector trong batch thay vì từng block độc lập — chấp nhận được vì lỗi JSON hỏng hoàn toàn hiếm gặp, đã ổn định từ khi đổi sang JSON contract).
+- Đã cập nhật **spec.md mục 16.2/31** (nguồn chính thức) — xem "Cập nhật thật (2026-08-10)" ở đó.
+- **Test:** `tests/unit/selectRelevantCharacters.test.ts` xoá test 2 hàm single-item cũ, thêm test cho `resolveLocalRelevantCharacterIds`/`containsPronounHint`/`buildBatchRelevantCharacterSelectorMessages`/`parseBatchRelevantCharacterSelectorResponse` (direct match, carry-forward, reset khi có tên mới, không carry khi chưa có gì, block thiếu trong response nhận `[]` thay vì throw, JSON hỏng vẫn throw). `tests/unit/scenePromptService.test.ts` thêm 2 test: nhiều block cần selector trong cùng 1 batch → đúng 1 selector call (không phải N), 1 block khớp tên trực tiếp + 1 block đại từ ngay sau → cả 2 resolve cục bộ, không gọi selector lần nào. 2 test cũ (`falls back to the internal LLM selector...`, `falls back to the compact index...`) giữ nguyên ý nghĩa, chỉ sửa response mock sang shape `relevant_characters` mới. Tổng `vitest` 261/261 pass, `tsc --noEmit` sạch.
+- Chưa có bằng chứng end-to-end với API thật (cần user tự chạy lại project nhiều SRT để đo số request/thời gian thực tế giảm bao nhiêu).
+
 ---
 
 ## Phase 9 — Run All Orchestration + Processing Tab + Retry/Resume/Pause/Cancel
@@ -663,6 +687,510 @@ Quy trình bắt buộc cho **mọi** phase có UI: `list_screens` (đã có s�
 - Đồng bộ toàn bộ Progress Indicator về đúng chuẩn DESIGN.md (2px, `emerald-success`) — trước đó `OverviewPage`/`ProcessingPage` lệch cả độ dày lẫn màu so với `ImagePromptsPage` (đã đúng sẵn từ Phase 8). Bổ sung 2 chỗ thiếu focus indicator (Vilao API model dropdown, Transcript panel).
 - Verify đủ 5 edge case (0 characters, transcript rỗng, không SRT, transcript cực lớn 256k ký tự, đóng app giữa lúc export) + Definition of Done 25/25 pass — không phát sinh regression, `vitest` vẫn 233/233, 0 console error khi kiểm thử tay qua Playwright.
 - User đã tự kiểm thử lại trên máy và xác nhận đạt. **Đây là phase cuối theo kế hoạch — V1 coi như hoàn thành.**
+
+---
+
+## Phase 14 — Post-V1: dọn UI thừa + Run Queue nhiều project + Delete-while-running (2026-08-10)
+
+V1 đã hoàn thành ở Phase 13. Phase này không có kế hoạch trước — phát sinh trực tiếp từ việc user tự chạy/test app thật trên máy Windows, yêu cầu chỉnh sửa liên tục theo từng vấn đề gặp phải. Ghi lại theo đúng thứ tự thực hiện trong session.
+
+**Ghi chú hoàn thành (2026-08-10):**
+- **Setup Windows lần đầu:** 3 lỗi build native module (`better-sqlite3`) chưa gặp trên macOS — Python 3.14 thiếu `distutils` (fix: cài `setuptools`), Node Windows build bằng `clang-cl` nhưng máy chỉ có toolset MSVC (fix: thêm `.npmrc` với `clang=0`), `ELECTRON_RUN_AS_NODE=1` do VS Code tự set cho terminal tích hợp khiến Electron chạy như Node thuần (phải unset trước khi `npm run dev`).
+- **Xoá các nút thao tác thủ công "đứng thay Run All"** — đúng ghi chú tạm thời từ Phase 5-8, giờ Run All (Phase 9) đã đủ nên bỏ: "Split SRT" (SrtPage), "Detect Characters"/"Generate Character Prompts" (CharactersPage).
+- **Export tự động hoá** (lệch spec.md mục 21/8.7 hiện tại — **chưa đồng bộ lại spec.md**, user chưa yêu cầu):
+  - `AppSettings.lastExportFolder` đổi vai trò từ "gợi ý cho dialog" thành "Default Export Folder" cấu hình 1 lần ở Settings > General (nút Browse) — `export.project()` không còn hỏi dialog mỗi lần, chỉ hỏi đúng 1 lần đầu (chưa từng cấu hình) rồi tự lưu làm default.
+  - `PipelineService.runProject()` tự gọi `ExportService.export()` ngay khi Run All hoàn tất (`completed`/`completed_with_errors`) — Export tab bỏ nút "Export Project" thủ công, chỉ còn preview + "Show in Finder".
+- **Dọn Home (`ProjectsListPage`):** bỏ action Export/Show in Finder (dư thừa vì đã auto-export), bỏ Rename + cột hiển thị model; `NewProjectPage` đổi full-width.
+- **Tính năng mới — Run Queue nhiều project:** `QueueService` (Main, thuần logic, không đụng Electron/DB, unit-test được) chạy tuần tự đúng 1 project/lần theo FIFO — 1 project lỗi không chặn hàng đợi, tự chuyển project kế tiếp. `queue.ipc.ts` + `useQueueStore` (Renderer) + trang **Queue** riêng (`/queue`, có trong sidebar Home). Thêm vào queue qua nút "Add to Queue" trên `NewProjectPage` (tạo project mới → chạy ngay nếu queue rảnh, ngược lại xếp hàng — hành vi có sẵn tự nhiên của `QueueService.add()`, không cần nhánh riêng). `PipelineService` đổi từ khởi tạo cục bộ trong `pipeline.ipc.ts` sang singleton `getPipelineService()` dùng chung với `queue.ipc.ts`, đảm bảo Pause/Cancel và guard "đang chạy" nhất quán dù chạy tay hay qua queue. Kèm fix 1 race condition phát hiện lúc lập kế hoạch: project đang nằm trong queue (chưa tới lượt) giờ bị chặn Run All thủ công ở TopBar/ProcessingPage, tránh chạy đè lên lượt của queue.
+- **Delete-while-running:** bỏ hẳn Pause + Cancel khi đang chạy (2 nút vốn làm y hệt nhau ở backend), thay bằng đúng 1 nút **Delete** — xoá được cả khi project đang chạy. `PipelineService.stopAndWait()` báo dừng và đợi bước đang chạy dở settle xong mới cho phép xoá (tránh lỗi foreign key khi ghi vào project đã bị xoá); nếu project đang nằm trong queue, `drain()` tự chuyển sang project kế tiếp ngay sau đó — không cần logic "chuyển tiếp" riêng. `DeleteProjectModal` tách thành component dùng chung cho Home/TopBar/ProcessingPage.
+- **Verify:** `tsc --noEmit` + `eslint` sạch xuyên suốt cả phase; `vitest` từ 233 (baseline Phase 13) → **243/243 pass** (thêm test cho `QueueService`: FIFO, lỗi không chặn queue, remove/dedupe/re-entrancy, callback; thêm test cho `PipelineService.stopAndWait()`: đợi run dở dang settle xong mới resolve, no-op khi không có gì chạy). App khởi động sạch mỗi lần smoke-test qua `npm run dev`.
+
+**Xác nhận bởi user (2026-08-10):** đã tự kiểm thử xong toàn bộ giai đoạn này trên máy Windows.
+
+---
+
+## Phase 15 — Post-V1: đồng bộ Queue/Dashboard, xoá Resume, chuẩn hoá format prompt, đóng gói Windows (2026-08-10)
+
+Tiếp tục không có kế hoạch trước — cùng phiên với Phase 14, phát sinh trực tiếp từ user tự chạy/test app thật trên Windows và report từng vấn đề qua screenshot. Ghi lại theo đúng thứ tự thực hiện.
+
+**Ghi chú hoàn thành (2026-08-10):**
+- **Đồng bộ Queue ↔ Dashboard (nhiều bug lồng nhau):**
+  - Tách `ProjectRow.tsx` (component dùng chung) từ `ProjectsListPage.tsx` — Queue tab giờ hiện đủ progress bar/status badge giống Home thay vì chỉ tên + Queued/Running đơn giản.
+  - `projects`/`deletedIds` chuyển từ `useState` riêng từng trang sang store dùng chung `useProjectsListStore.ts` — bug trước đó: xoá project ở Queue không cập nhật Dashboard (và ngược lại) vì 2 trang giữ state riêng.
+  - Fix `useQueueStore.subscribe()` không tự refetch `queue.list()` sau lần đầu — Queue tab có thể kẹt hiển thị trạng thái cũ nếu lỡ miss 1 `queue:updateEvent`.
+  - Fix `ProjectService.open()` downgrade nhầm `processing` → `paused` cho project **đang thật sự chạy** (chỉ nên downgrade khi force-quit, không còn gì chạy) — thêm tham số bắt buộc `isActuallyRunning` (từ `PipelineService.isRunning()`, có sẵn nhưng chưa ai dùng). Thêm IPC `projects.get()` (đọc thuần, không side-effect) để `usePipelineStore`'s live refresh dùng thay vì `.open()`.
+  - Fix card Scene Generation kẹt "Pending" khi run được kích hoạt qua Queue (không phải tự bấm Run All ở tab đang mở) — điều kiện "Running" đổi từ chỉ `isRunning` (cờ cục bộ) sang `isRunning || isProcessing` (`isProcessing` lấy từ `currentProject.status`, luôn đúng bất kể ai kích hoạt run).
+  - Dashboard đổi từ hiển thị mọi project sang **lọc bỏ hẳn** project đang nằm trong Run Queue (queued/running) — chỉ còn thấy ở tab Queue, theo yêu cầu user. Thêm empty-state riêng "Everything's in the queue".
+- **Xoá nút Resume khỏi UI** (TopBar, Processing tab, Home/Queue row) — `status=paused` giờ chỉ còn badge tĩnh "Paused", không có nút hành động. Cố ý làm fail lại DoD mục 16 ("App có resume") — cơ chế resume ở tầng service không đổi, chỉ mất đường vào UI cho case `paused`; Retry Failed (`failed`/`completed_with_errors`) không bị ảnh hưởng.
+- **Xoá cụm action trùng lặp ở Processing tab** — "Processing…/Completed/Paused/Run All/Retry Failed/Delete" từng lặp y hệt cả ở TopBar lẫn Processing tab; giữ đúng 1 nơi (TopBar, vì hiển thị trên mọi tab con).
+- **Delete-while-running không còn block UI** chờ `stopAndWait()` — modal đóng ngay, xoá chạy nền (fire-and-forget), optimistic-hide qua `useProjectsListStore.markDeleted()`.
+- **Thêm action "Open in Folder"** vào `ProjectRow` (Home + Queue) — tái dùng flow "Show in Finder" có sẵn ở Export tab, không thêm IPC mới.
+- **Thêm nút "Delete All"** ở header Dashboard — chỉ xoá project đang hiển thị (không đụng project trong Queue), có modal xác nhận riêng.
+- **New Project "Add to Queue"** đổi điều hướng sau khi tạo từ `/projects/:id/processing` sang thẳng `/queue`.
+- **Chuẩn hoá format Scene/Image Prompt** (`DEFAULT_SCENE_GENERATION_PROMPT`, `src/shared/prompts.ts`) — phát hiện qua nhiều lần export thật, mỗi batch (1 lời gọi LLM riêng) tự diễn giải rule khác nhau:
+  - Rule 2 siết thành format cứng `@Character_ID [Visual DNA traits]` khi nhắc nhân vật — trước đó có batch viết tên thường không dấu `@`.
+  - Rule 1 thêm bắt buộc format `"Panel N (vị trí, kích thước):"` — trước đó có batch dùng label tả nội dung không đánh số ("BOTTOM PANEL:").
+  - Rule 9 mới — cấm nội dung ngoài cấu trúc đã định nghĩa (chặn kiểu tự thêm "Overall mood: ...").
+  - Rule 10 mới + **lưới an toàn ở code** (`normalizePromptText()`, `generateScenePrompt.ts`) — 1 prompt phải nằm đúng 1 dòng, không xuống dòng giữa các panel; hàm này tự thay `\n` bằng khoảng trắng ngay khi parse response, không phụ thuộc model có tuân thủ rule hay không (khác 3 rule trên, vốn chỉ dựa vào wording).
+  - Migration `0002_normalize_scene_prompt_newlines` — chuẩn hoá lại luôn `scene_prompts.prompt` **đã có sẵn trong DB** từ trước khi có `normalizePromptText()` (batch đã `success` thì không bao giờ tự chạy lại nên sẽ mãi giữ format cũ nếu không có migration này). Data cleanup thuần whitespace, không phải schema change.
+- **Xoá toolbar Transcript** (Paste/Select All/Clear/Load `.txt`, `TranscriptPage.tsx`) — theo yêu cầu user, biết rõ hệ quả mất khả năng load file `.txt` vào project đã tồn tại (Paste/Select All/Clear vẫn làm tay được qua textarea).
+- **Xoá nút "Generate Image Prompts"** (`ImagePromptsPage.tsx`) — nút thao tác thủ công cuối cùng còn sót lại từ Phase 5-8 (3 nút kia đã xoá ở Phase 14). Trang giờ thuần hiển thị + Retry riêng từng scene lỗi, cùng pattern SrtPage/CharactersPage. "Copy All" đổi sang gọi thẳng `formatImagePromptsFile()` thay vì tự dựng format riêng (2 nơi từng lệch nhau sau lần đổi format export).
+- **Đổi format export `image_prompts.txt`** (mục 24, `formatImagePromptsFile()`) — từ `"PROMPT 00N:"` xuống dòng + cách 1 dòng trống rồi mới tới prompt, cách nhau 2 dòng trống giữa các prompt, sang: header liền dòng với prompt (`"PROMPT 00N: <prompt>"`), chỉ 1 dòng trống giữa các prompt. Theo yêu cầu user.
+- **Đóng gói Windows lần đầu** (`electron-builder.yml`, sớm hơn kế hoạch V2) — build thật + verify trực tiếp bằng cách `require()` trên chính binary đã đóng gói, phát hiện bug nghiêm trọng: `better-sqlite3` tự phụ thuộc package JS thuần `bindings`, nhưng electron-builder mặc định chỉ unpack đúng `better-sqlite3` (có file `.node`) khỏi `app.asar`, để `bindings` kẹt lại nén trong asar — `require('bindings')` từ vị trí đã unpack không tìm ra, app mở lên rồi tắt ngay lúc chạm SQLite lần đầu, không có crash log. Sửa bằng `asar: false` (tắt hẳn, tránh cả lớp bug này thay vì hand-pick từng transitive dependency cần unpack). Thêm `win.target: nsis`, thêm script `npm run dist` (`build` + `electron-builder --win`). **Chưa tự build/cài thử bản NSIS installer thật** trên máy khác — mới verify được cấu trúc package (`out/`, `node_modules`, native module) và `require()` thành công, chưa click-through UI thật (môi trường agent bị chặn mở GUI thật).
+- **Verify:** `tsc --noEmit` + `eslint` sạch xuyên suốt cả phase. `vitest` từ 243 (baseline Phase 14) → **248/248 pass** (thêm 5 test: `ProjectService.open()` không downgrade khi đang chạy thật; `normalizePromptText()` qua `parseSceneGenerationResponse`; 3 test cho migration `0002` — verify qua `node:sqlite` built-in khi `better-sqlite3` bị khoá bởi môi trường, không phải giả định). `exportFormat.test.ts`/`exportService.test.ts` cập nhật lại theo format export mới (không đổi số lượng test).
+
+**Xác nhận bởi user (2026-08-10):** đã tự kiểm thử xong toàn bộ giai đoạn này trên máy Windows.
+
+---
+
+## Phase 16 — Post-V1: Overview real-time, hạ Max Retry mặc định, thêm Scene Generation Batch Size (2026-08-10)
+
+Tiếp tục không có kế hoạch trước — cùng ngày với Phase 14/15, phát sinh trực tiếp từ user report bug + 2 yêu cầu tính năng mới trong lúc tự chạy/test app thật. (Tối ưu cost/latency cho Internal Relevant Character Selector — batch hoá selector call + local pronoun carry-forward, cũng làm cùng ngày — đã ghi nhận riêng ở addendum cuối Phase 8, không lặp lại ở đây.)
+
+**Ghi chú hoàn thành (2026-08-10):**
+- **Fix bug — Overview tab không cập nhật real-time:** user report "project chạy xong mà không được cập nhật khi đang ở project detail, thoát ra vào dashboard mới thấy thành công". Nguyên nhân: `OverviewPage.tsx` (trang mặc định khi mở 1 project) fetch metrics đúng 1 lần lúc mount, không subscribe kênh live nào — khác `TopBar.tsx`/`ProcessingPage.tsx` vốn đã có cơ chế này từ Phase 9. Sửa bằng cách mirror đúng pattern đã chứng minh hoạt động ở `ProcessingPage.tsx`: subscribe `usePipelineStore`, lắng nghe `scenePrompts.onProgress` để merge kết quả batch trực tiếp, refetch khi `tasks` đổi (bắt được cả run kích hoạt qua Queue, không chỉ tự bấm Run All), refetch khi `isRunning` chuyển về false. Verify bằng driver Electron/Playwright thật (không mock) — tạo project qua UI thật, set fake API key, xác nhận `refresh()` gọi lại **4 lần trong vòng 70ms** sau khi bấm Retry Failed trong lúc đang đứng ở tab Overview, khớp đúng lúc backend thật sự re-run (`DETECT_CHARACTERS` task `updatedAt` đổi cùng lúc) — không cần rời trang.
+- **Hạ Max Retry mặc định + bỏ UI chỉnh** (theo yêu cầu user "Để retry là 1, không cần setting nữa"): `DEFAULT_MAX_RETRY` (`ProjectService.ts`) hạ từ 3 xuống 1; ô "Max Retry" bị xoá khỏi Settings > Advanced > Pipeline Tuning (chỉ còn Scene Generation Concurrency lúc này). **Không phải schema change** — cột `max_retry`/`updatePipelineSettings()` giữ nguyên hoàn toàn, chỉ mất đường vào UI; form giờ luôn gửi lại `maxRetry` hiện tại của project (pass-through) khi Save. Nhiều unit test (rate-limit backoff, escalate Context Too Large, Pause giữa lúc retry) trước đó ngầm dựa vào default cũ (3) để có đủ số lần thử — sửa bằng cách tự nâng `maxRetry` qua `updatePipelineSettings()` ngay trong test thay vì phụ thuộc default toàn cục.
+- **Thêm setting mới — Scene Generation Batch Size** (theo yêu cầu user, chỉ thẳng vào card Pipeline Tuning hỏi thêm setting "gom bao nhiêu SRT vào mỗi prompt tạo ảnh"). **Đây là schema change thật** — đã dùng `AskUserQuestion` hỏi lại range hợp lệ trước khi implement theo CLAUDE.md, user chọn 1–20. Migration mới `0003_add_scene_batch_size` thêm cột `projects.scene_batch_size` (default 10, backfill project cũ về đúng giá trị hằng số cũ `SCENE_PROMPT_BATCH_SIZE` từng dùng). `ScenePromptService.generate()` đổi từ dùng hằng số cố định sang đọc `project.sceneBatchSize`; thêm ô "SCENE GENERATION BATCH SIZE" vào cùng card Pipeline Tuning; `updatePipelineSettings` (IPC/service/query) đổi shape thật, nhận thêm field thứ 3 trong cùng 1 lời gọi.
+- **Verify xuyên suốt Phase 16:** `tsc --noEmit` sạch cả 3 tsconfig, `eslint` sạch sau mỗi bước. `vitest` từ 261 (baseline sau addendum Phase 8 cùng ngày) → **264/264 pass** — không đổi số lượng test cho 2 bug/tính năng đầu (chỉnh lại test có sẵn), +3 test mới cho Scene Batch Size (2 test migration `0003`, 1 test `ScenePromptService` xác nhận batch size tuỳ chỉnh thật sự đổi số request).
+- Chi tiết field/migration đầy đủ xem [schema.md](schema.md) Changelog Phase 16 (Max Retry) + Phase 17 (Scene Batch Size) — 2 entry riêng ở schema.md vì đó là tài liệu theo dõi *thay đổi schema* (1 entry/thay đổi cột), khác quy ước "1 phase = 1 session" của file này.
+
+**Xác nhận bởi user (2026-08-10):** đã tự kiểm thử xong toàn bộ giai đoạn này.
+
+---
+
+## Phase 17 — Post-V1: Channels (setting riêng theo channel, project dùng setting của channel) (2026-08-10)
+
+Ngoài phạm vi V1 gốc — user yêu cầu trực tiếp thêm 1 tab Channel: mỗi channel có setting riêng (giống bộ setting project đã có), setting chung (Settings > General/Prompts) đổi vai trò thành default khi tạo channel mới, project thuộc channel nào dùng setting của channel đó.
+
+**Trước khi implement:** hỏi lại 4 quyết định kiến trúc qua `AskUserQuestion` (đúng CLAUDE.md, vì đây là schema change thật) — phạm vi setting theo channel (chọn: General + Prompts + Pipeline Tuning, không gồm Vilao API key/Max Retry), cách project dùng setting channel (chọn: copy lúc tạo, không tham chiếu sống), cách backfill project cũ (chọn: tự tạo channel "Default", gán hết project cũ vào đó), có cho đổi channel sau khi tạo không (chọn: không). Sau đó vào Plan Mode, viết plan chi tiết ra file, chờ user duyệt qua `ExitPlanMode` rồi mới code — đúng yêu cầu "khi tôi duyệt mới được implement".
+
+**Ghi chú hoàn thành (2026-08-10):**
+- **Migration mới `0004_add_channels`** — bảng `channels` (Max Characters/Duration/Model/3 prompt template/Scene Concurrency/Scene Batch Size) + cột `projects.channel_id`. Backfill project cũ vào 1 channel `"Default"` tạo sẵn bởi chính migration.
+  **Sự cố phát hiện khi implement (không có trong plan ban đầu):** dự định gộp `ALTER TABLE ... NOT NULL REFERENCES ... DEFAULT '<uuid>'` trong 1 câu (giống Phase 16's `0003`) nhưng SQLite từ chối bất cứ khi nào bảng đã có row sẵn ("Cannot add a REFERENCES column with non-NULL default value") — đúng ngay use case chính (DB thật của user đã có project). Lộ ra qua 2 test fail trong `migrations.test.ts` (khác `channelService.test.ts` chạy trên DB rỗng nên không lộ). Fix: tách `ADD COLUMN` (nullable) + `UPDATE` backfill riêng — cột không có `NOT NULL` cứng ở DB, chỉ đảm bảo ở tầng application (`ProjectService.create()` luôn set giá trị thật).
+- **`ProjectService.create()`** nhận thêm `channelId` (optional với fallback về channel Default, để ~60 unit test gọi `service.create()` trực tiếp không phải sửa hết — chỉ IPC handler thật `projects:create` mới bắt buộc truyền `channelId` từ Renderer). `defaults` thêm `sceneConcurrency`/`sceneBatchSize` (copy từ channel thay vì hằng số cố định).
+- **Run All đọc setting từ channel, không phải AppSettings global nữa** — `resolvePipelineRuntime()` (`src/main/pipelineRuntime.ts`) đổi từ `getAppSettings().selectedModel/promptSettings` sang tra project → channel → `ChannelService.get()`. Đây là chỗ áp dụng thật yêu cầu "project dùng setting của channel nó thuộc về" cho cả project tạo trước Phase 17 (channel Default). `exportFolder` vẫn global, ngoài phạm vi channel. Các IPC thao tác thủ công (`characters.detect`/`generatePrompts`/`retryPrompt`, `scenePrompts.generate`/`retry` — còn tồn tại nhưng không còn nút UI nào gọi từ Phase 14/15) đổi theo cùng nguồn để không lệch dữ liệu với Run All.
+- **UI mới:** tab **Channels** trong `HomeSidebar.tsx` (`/channels` danh sách, `/channels/new`, `/channels/:channelId/edit`) — Card/Button/EmptyState/Modal có sẵn, không có Stitch mockup cho màn này (cùng tình huống Overview/Characters/Image Prompts/Export ở các phase trước). New Project thêm dropdown Channel bắt buộc, không đổi được sau khi tạo. Settings > General/Prompts đổi copy text sang "default cho channel mới" thay vì "cho project mới".
+- **Verify:** `tsc --noEmit` sạch cả 3 tsconfig, `eslint` sạch; `vitest` 264 (baseline Phase 16) → **291/291 pass** (channelService.test.ts mới 20 test, migrations.test.ts +4 test cho `0004`, projectService.test.ts +3 test cho channelId fallback/override).
+- Chi tiết field/migration đầy đủ xem [schema.md](schema.md) Changelog Phase 18 (số thứ tự lệch 1 so với phase này — cùng lý do đã ghi ở Phase 16: schema.md đếm theo *entry thay đổi schema*, plan.md đếm theo *phiên làm việc*).
+- Chưa có bằng chứng end-to-end với Electron app thật (chỉ verify qua `vitest`/`tsc`/`eslint`) — cần user tự mở app sau khi build lại để xác nhận Channels tab + New Project channel picker hoạt động đúng trên UI thật.
+
+---
+
+## Phase 18 — Post-V1: Average Characters per SRT + Variance % (2026-08-11)
+
+Ngoài phạm vi V1 gốc — user report "nhiều câu bị ngắn quá" (thuật toán chia SRT cũ dùng `maxCharacters` làm ngưỡng cứng tuyệt đối, chốt block ngay khi câu kế tiếp không vừa). Đề xuất trực tiếp: đổi "Maximum characters per SRT" thành "Average characters per SRT" + 1 biên độ xê dịch % (ví dụ trung bình 100, ±30%) để thuật toán co giãn, tránh block quá ngắn.
+
+**Trước khi implement:** hỏi lại 3 quyết định qua `AskUserQuestion` (đúng CLAUDE.md, schema change thật) — biên độ là field riêng cho user tự chỉnh hay hằng số cố định (chọn: field riêng), đổi tên cột `max_characters` → `avg_characters` hay chỉ đổi label (chọn: đổi tên cột), ưu tiên đạt tối thiểu trước khi ngắt hay luôn tôn trọng ngưỡng trên (chọn: ưu tiên đạt tối thiểu). Sau đó vào Plan Mode viết plan chi tiết, chờ user duyệt qua `ExitPlanMode` rồi mới code.
+
+**Ghi chú hoàn thành (2026-08-11):**
+- **Migration mới `0005_rename_avg_characters_and_add_variance`** — đổi tên `projects.max_characters`/`max_characters_snapshot`/`channels.max_characters` sang `avg_characters`/`avg_characters_snapshot`/`avg_characters` (SQLite `RENAME COLUMN`), thêm `variance_percent` (default 30) vào cả `projects` và `channels`.
+- **Thuật toán `splitSrt.ts`** đổi từ 1 ngưỡng `maxCharacters` cứng sang khoảng `[avg × (1−variance/100), avg × (1+variance/100)]` — `gatherBlocks()` ưu tiên nhét thêm câu để đạt ngưỡng dưới trước khi ngắt block, chấp nhận vượt nhẹ ngưỡng trên khi cần.
+  **Bug phát hiện khi implement (không có trong plan ban đầu):** điều kiện "ưu tiên đạt tối thiểu" ban đầu viết là `currentLength < min`, nhưng ở `variance=0` (`min === max === avgCharacters`) điều kiện này gần như luôn đúng, ép **toàn bộ transcript gộp vào 1 block duy nhất** bất kể ngưỡng trên — phá vỡ cam kết "variance 0 = y hệt thuật toán cũ" đã hứa trong plan. Lộ ra qua 4 test fail (`srtSplitter.test.ts`) + 1 test fail (`scenePromptService.test.ts`, số block đổi do variance mặc định 30% dù test không quan tâm thuật toán chia). Fix: thêm điều kiện `min < max` vào override, vô hiệu hoá nhánh đó khi không có khoảng thật sự.
+- **Đổi tên field xuyên suốt** (không đổi kiến trúc) — `entities.ts`, `projects.queries.ts`/`channels.queries.ts`, `ProjectService.ts`/`ChannelService.ts`/`PipelineService.ts`/`SrtService.ts`, `validateRun.ts`, `AppSettings`/`appSettingsStore.ts`, và toàn bộ renderer form (`settings.schema.ts`, `GeneralSettingsPage.tsx`, `channel.schema.ts`, `ChannelForm.tsx`, `NewChannelPage.tsx`, `EditChannelPage.tsx`, `ChannelsPage.tsx`) — `maxCharacters` → `avgCharacters`, thêm `variancePercent` (range 0–90) mọi nơi.
+- **Verify:** `tsc --noEmit` sạch cả 3 tsconfig, `eslint` sạch; `vitest` 291 (baseline Phase 17) → **300/300 pass**.
+- Chi tiết field/migration đầy đủ xem [schema.md](schema.md) Changelog Phase 19 (số thứ tự lệch 1 so với phase này, cùng lý do đã ghi ở Phase 16/17).
+- Chưa có bằng chứng end-to-end với Electron app thật (chỉ verify qua `vitest`/`tsc`/`eslint`) — cần user tự mở app sau khi build lại để xác nhận Settings > General/Channel form hoạt động đúng và kết quả Split SRT (tab SRT) không còn block quá ngắn bất thường.
+
+**Addendum (2026-08-11) — bỏ hẳn việc cắt giữa câu trong `splitOversizedSentence()` (2 bước, escalate theo yêu cầu user):**
+1. Bước đầu: user hỏi lại tại sao câu quá dài (11.3) lại bị cắt tại dấu phẩy — thử fix bằng cách đổi `OVERSIZED_SPLIT_CHARS` (`;`/`:`/`,`) thành mảng rỗng, giữ lại nhánh whitespace/hard-cut.
+2. User xác nhận đó **chưa đủ** — rule bắt buộc là "chưa hết câu thì không được cắt", tức **không được hard-cut/cắt tại whitespace giữa câu nữa, dưới bất kỳ hình thức nào**. Sửa lại: **xoá hẳn `splitOversizedSentence()`** (không còn khái niệm "chunk hoá câu quá dài") — `units` đưa thẳng vào `gatherBlocks()` là danh sách câu nguyên vẹn từ `segmentSentences()`, không qua bước chia nhỏ nào nữa. 1 câu đơn dài hơn `max` giờ **luôn trở thành 1 block riêng, độc lập, có thể vượt `max` bao nhiêu cũng được** — cơ chế này tận dụng đúng nhánh `!current` sẵn có trong `gatherBlocks()` (block mới luôn nhận unit đầu tiên bất kể độ dài), không cần thêm code riêng.
+
+**Không phải schema/migration change** — thuần sửa 1 pure function (`src/main/pipeline/splitSrt.ts`), đã xoá `OVERSIZED_SPLIT_CHARS`/`splitOversizedSentence()` (dead code). Cập nhật lại `tests/unit/srtSplitter.test.ts` — 6 test trước đó giả định câu quá dài bị chia nhỏ (`<=max`/`<=20`/hard-cut không phá vỡ grapheme) đổi hẳn kỳ vọng sang "giữ nguyên 1 block, vượt `max`, không cắt" (2 test còn lộ ra khi rà lại: dùng chung transcript `'Short one. Also short. This third sentence is much too long to fit.'`, ban đầu chỉ sửa 1 trong 2 chỗ dùng transcript đó, verify bằng cách chạy trực tiếp `npx vitest run tests/unit/srtSplitter.test.ts` mới phát hiện chỗ thứ 2 — không rebuild `better-sqlite3` được lúc đó vì bị electron.exe khoá file, nên chỉ verify được file test thuần không đụng DB). Đồng bộ lại mô tả ở [spec.md](spec.md) mục 11.3. `tsc`/`eslint` sạch, `vitest tests/unit/srtSplitter.test.ts` 14/14 pass — các file test khác (dùng better-sqlite3) chưa verify lại được vì lý do khoá file trên, cần chạy `npm test` đầy đủ sau khi user đóng app.
+
+---
+
+## Phase 19 — Post-V1: Export folder nested under Channel name (2026-08-11)
+
+Ngoài phạm vi V1 gốc — user yêu cầu trực tiếp: channel dùng Export Folder ở setting chung (không đổi), nhưng khi project chạy trong 1 channel, output phải nằm trong 1 thư mục con mang tên channel đó thay vì đổ thẳng vào Default Export Folder cùng cấp với mọi project khác.
+
+**Không phải schema change** — `channels.name` đã có sẵn từ Phase 17, chỉ đọc thêm qua `project.channelId` khi build đường dẫn, không cần hỏi lại/Plan Mode cho bước này.
+
+**Ghi chú hoàn thành (2026-08-11):**
+- **`ExportService.ts`** đường dẫn output đổi từ `{ExportFolder}/{Project_Name}/` sang `{ExportFolder}/{Channel_Name}/{Project_Name}/` — tên channel đọc **hiện hành** (không snapshot), giống `Project_Name` vốn cũng không snapshot.
+- **`sanitizeProjectFolderName()` đổi tên thành `sanitizeFolderName(name, fallback)`** (`src/shared/exportFormat.ts`) — dùng chung cho cả tên channel lẫn tên project, thêm tham số `fallback` để mỗi bên có default riêng (`Untitled_Channel`/`Untitled_Project`).
+- **`ExportPage.tsx`** (preview) gọi thêm `channels.get()` để hiện đúng cấu trúc `Channel_Name/Project_Name/` — khớp 100% với ExportService nhờ dùng chung hàm sanitize.
+- **`GeneralSettingsPage.tsx`** (card Export) đổi copy text từ "writes straight here as Project_Name/" sang "Channel_Name/Project_Name/".
+- **Verify:** `tsc --noEmit` sạch cả 3 tsconfig, `eslint` sạch; `vitest` pass toàn bộ — `exportFormat.test.ts`/`exportService.test.ts` cập nhật theo path mới + test mới cho project trong channel tuỳ chỉnh.
+- Chi tiết đầy đủ xem [schema.md](schema.md) Changelog Phase 20 (số thứ tự lệch 1 so với phase này, cùng lý do đã ghi ở các phase trước).
+- Chưa có bằng chứng end-to-end với Electron app thật — cần user tự chạy Run All cho 1 project thuộc channel không phải Default để xác nhận cấu trúc thư mục thật trên đĩa.
+
+---
+
+## Phase 20 — Post-V1: Processing tab real-time fix cho queue-triggered run + bỏ nút Remove khỏi Queue (2026-08-11)
+
+Ngoài phạm vi V1 gốc, 2 bug/UX report trực tiếp từ user trong cùng phiên. **Không phải schema change** cho cả 2.
+
+**Bug 1 — Processing tab không cập nhật real-time khi Scene Generation chạy qua Run Queue:**
+- User report: "xử lý Scene Generation xong nhưng không cập nhật real time, phải out project ra mới nhận được success".
+- Đã sửa 1 lần (wiring `onSceneProgress` qua `PipelineService.runProject()`/`pipeline.ipc.ts`/`queue.ipc.ts`) nhưng user báo vẫn còn lỗi.
+- **Tự dựng 1 instance Electron cô lập** (Playwright `_electron`, `--user-data-dir` riêng, không đụng dữ liệu/app đang chạy thật của user, mock `global.fetch` trong Main để không gọi Vilao thật) để tái hiện trực tiếp thay vì đoán tiếp — phát hiện root cause thật: `ProcessingPage.tsx` chỉ refetch `srtBlocks`/`characters`/`characterPrompts` khi `isRunning` (cờ chỉ đúng khi *chính cửa sổ này* gọi Run All trực tiếp) chuyển `true`→`false`. Nhưng cách duy nhất chạy 1 project **mới** là qua **Add to Queue** (`QueueService`), nên `isRunning` không bao giờ thành `true` — `srtBlocks` bị đóng băng ở giá trị lúc mount (thường rỗng), Scene Tasks list/card không bao giờ render đúng cho tới khi remount trang.
+- `OverviewPage.tsx` đã được vá đúng lỗi này từ Phase 16 (refetch khi `tasks` đổi — kênh bắn cho cả 2 trường hợp) nhưng `ProcessingPage.tsx` bị bỏ sót. Fix: thêm đúng effect đó vào `ProcessingPage.tsx`.
+- Verify: build lại `out/` (`electron-vite build`, không đụng native module đang chạy của user), replay đúng luồng Add to Queue thật trên instance cô lập — log xác nhận card + list cập nhật live từng bước, không cần rời trang.
+
+**Bug 2 (UX) — nút Remove ở Queue trùng/thừa với Delete:**
+- User report: row `queued` có cả nút **X** (Remove from queue, riêng cho Queue) lẫn nút **Delete** (trash, chuẩn `ProjectRow`) đứng cạnh nhau — cùng đọc như "xoá" nhưng hành vi khác nhau, gây nhầm.
+- Hỏi lại user cách đơn giản hoá — chọn: **bỏ hẳn nút X**, chỉ giữ Delete. `projects.ipc.ts`'s delete handler đã tự dequeue trước khi xoá (có sẵn từ Phase 14) nên Delete vẫn xử lý đúng "gỡ khỏi hàng đợi" — chỉ khác giữ lại project không xoá được nữa qua đường Queue.
+- `QueuePage.tsx` bỏ nút X + `Button`/`X` import không dùng nữa. `queue.remove` (IPC)/`useQueueStore.remove()` **giữ nguyên**, chỉ không còn UI nào gọi — cùng convention "giữ IPC, bỏ nút" từ Phase 14.
+- Verify: `tsc --noEmit`/`eslint` sạch.
+
+---
+
+## Phase 21 — Post-V1: Channel option "No Characters" (2026-08-11)
+
+Ngoài phạm vi V1 gốc — user yêu cầu trực tiếp: hiện tại kịch bản có nhân vật cốt truyện cụ thể là default (đúng, giữ nguyên), cần thêm 1 option nữa trong Channel Settings cho transcript **không có nhân vật/cốt truyện** — với channel đó, project không cần chạy 2 bước Character Detection và Character Prompt Generation.
+
+**Trước khi implement:** hỏi lại qua `AskUserQuestion` 2 quyết định UX (schema change thật, theo CLAUDE.md) —
+- Channel form khi tắt "Has Story Characters": **ẩn hẳn** 2 card Character Detection Prompt / Character Generation Prompt (không phải disable mờ).
+- Sidebar của project thuộc channel "No Characters": **ẩn hẳn** mục "Characters" khỏi sidebar.
+- Default cho channel mới: **bật** ("Có nhân vật") — giữ đúng hành vi hiện tại làm mặc định.
+
+**Phát hiện quan trọng, giảm phạm vi thay đổi:** `ScenePromptService.generateBatch()` đã tự xử lý tốt `characters.length === 0` từ trước (mọi block được gán thẳng `characterIds: []`, không gọi Relevant Character Selector; `buildRelevantCharactersSection([])`/`buildRelevantCharacterPromptsSection([], ...)` trả về `(none)`); `formatCharacterPromptsFile([], [])` (`exportFormat.ts`) đã trả về chuỗi rỗng. Không cần sửa `ScenePromptService`/`generateScenePrompt.ts`/`selectRelevantCharacters.ts`/`ExportService` — chỉ cần chặn 2 bước Character Detection/Generation không chạy.
+
+**Kế hoạch:**
+- **Schema:** thêm `channels.has_characters` + `projects.has_characters` (INTEGER 0/1, NOT NULL DEFAULT 1) — migration `0006_add_has_characters` (2 câu `ADD COLUMN ... DEFAULT 1`, không có `REFERENCES` nên hợp lệ dù bảng đã có row, giống `variance_percent` ở migration 0005).
+- **Backend:** `entities.ts` (`Channel`/`Project` thêm `hasCharacters: boolean`) → `channels.queries.ts`/`projects.queries.ts` (map cột mới) → `ChannelService` (`ChannelInput` thêm field, không đổi `validate()` — 2 prompt character vẫn required) → `ProjectService.create()` (`DEFAULT_HAS_CHARACTERS = true`, copy từ `defaults.hasCharacters`) → `projects.ipc.ts` (`projects:create` truyền `hasCharacters: channel.hasCharacters`) → `PipelineService.runProjectInternal()` (Step 2 Detect Characters: khi `!project.hasCharacters` thì `ensureTaskSuccess()` thẳng, không gọi `characterService.detect()`; Step 3 tự skip vì `characters.length` luôn 0) → `validateRun.ts` (`validateProjectForRun` bỏ qua 2 check prompt Character Detection/Generation khi `hasCharacters===false`).
+- **Frontend:** `channel.schema.ts` + `ChannelForm.tsx` (checkbox "Has Story Characters", ẩn 2 card prompt liên quan khi tắt — RHF giữ nguyên `defaultValues` cho field không mount nên vẫn submit hợp lệ) → `NewChannelPage.tsx`/`EditChannelPage.tsx` (default true / copy từ channel) → `ChannelsPage.tsx` (badge "No Characters" trên card) → `Sidebar.tsx` (ẩn nav "Characters" khi `currentProject.hasCharacters===false`) → `CharactersPage.tsx` (empty state riêng khi vào thẳng URL) → `ProcessingPage.tsx` (ẩn 2 card coarse step liên quan) → `OverviewPage.tsx` (ẩn 2 MetricCard liên quan).
+- Cập nhật `schema.md` (bảng `channels`/`projects` + Changelog).
+
+**Ghi chú hoàn thành (2026-08-11):**
+- Đúng như dự đoán lúc khảo sát code — `ScenePromptService.generateBatch()`/`generateScenePrompt.ts`/`selectRelevantCharacters.ts`/`ExportService` **không cần sửa gì**, đã tự hỗ trợ `characters.length === 0` từ trước (không có bug/edge case nào lộ ra khi implement, khác vài phase trước).
+- **Migration `0006_add_has_characters`** — 2 cột boolean (`channels.has_characters`, `projects.has_characters`, `INTEGER NOT NULL DEFAULT 1`), cùng 1 statement như migration `0005` vì không có `REFERENCES`.
+- **`PipelineService.runProjectInternal()`** Step 2 (Detect Characters) thêm nhánh `!project.hasCharacters` → `ensureTaskSuccess()` thẳng, không gọi `characterService.detect()`. Step 3 không đổi gì (tự skip vì `characters.length` luôn 0 khi Step 2 bị bỏ qua).
+- **`validateProjectForRun()`** bọc 2 check Character Detection/Generation prompt trong `if (project.hasCharacters)` — project `hasCharacters=false` chạy được dù 2 prompt đó rỗng.
+- **`ChannelForm.tsx`**: checkbox "Has Story Characters" + `watch('hasCharacters')` để ẩn/hiện 2 `<Card>` Character Detection/Generation Prompt — xác nhận đúng giả thuyết lúc lên plan: React Hook Form (`shouldUnregister` mặc định `false`) giữ nguyên giá trị `defaultValues` cho field không mount, nên submit vẫn hợp lệ mà không cần nới lỏng `ChannelService.validate()`.
+- **UI ẩn theo channel:** `Sidebar.tsx` đọc `useProjectStore` lọc bỏ nav "Characters"; `CharactersPage.tsx` có `EmptyState` riêng phòng URL trực tiếp; `ProcessingPage.tsx` lọc `COARSE_STEPS` chỉ còn `SPLIT_SRT` khi `!currentProject.hasCharacters`; `OverviewPage.tsx` ẩn 2 `MetricCard` Characters/Character Prompt; `ChannelsPage.tsx` thêm badge "No Characters" trên card channel tương ứng.
+- **Verify:** `tsc --noEmit` sạch cả 3 tsconfig, `eslint` sạch. `vitest` 300 (baseline Phase 20) → **309/309 pass** — thêm 1 test `validateRun.test.ts`, 2 test `channelService.test.ts` (roundtrip `hasCharacters` + default true trên channel "Default"), 1 test `projectService.test.ts` (copy `hasCharacters=false` từ `defaults`), 1 test `pipelineService.test.ts` (project `hasCharacters=false` — không gọi `chat()` cho DETECT/GENERATE_CHAR_PROMPT, cả 2 `pipeline_tasks` thành `success`, Scene Generation vẫn hoàn tất), 2 test `migrations.test.ts` cho `0006` (backfill `true` cho row cũ, insert mới tự chọn `false`).
+- Chưa có bằng chứng end-to-end với Electron app thật (chỉ verify qua `vitest`/`tsc`/`eslint`) — cần user tự mở app sau khi build lại để xác nhận: tạo Channel tắt "Has Story Characters" → 2 card prompt biến mất; tạo Project trong channel đó, Run All → Processing tab chỉ còn Split SRT + Scene Generation, Sidebar không có "Characters", Overview không có 2 card Character; export ra `character_prompts.txt` rỗng, `image_prompts.txt`/`.srt` bình thường; project ở channel cũ (có nhân vật) không đổi hành vi.
+
+---
+
+## Phase 22 — Post-V1: Prompt Scene/Image Generation riêng cho channel "No Characters" (2026-08-11)
+
+Ngoài phạm vi V1 gốc — user hỏi lại về bước Relevant Character Selector (1 lời gọi LLM nội bộ, không phải prompt user chỉnh được, chạy trước Scene Generation để xác định nhân vật liên quan mỗi block) và nhận ra channel "No Characters" (Phase 21) vẫn đang tái dùng nguyên `scene_generation_prompt` của channel có nhân vật — phần "Relevant Characters"/"Character Reference" trong đó chỉ luôn hiện `(none)`. Yêu cầu trực tiếp: thêm 1 prompt Scene/Image Generation riêng, không nhắc tới nhân vật, cho trường hợp này.
+
+**Đây là schema change thật** (thêm 1 cột `channels.scene_generation_prompt_no_characters`) — không dừng lại hỏi qua `AskUserQuestion` vì yêu cầu đã đủ cụ thể để tự quyết định thiết kế, nhưng có tự cân nhắc kỹ 1 quyết định kiến trúc quan trọng trước khi code: **không** thêm cột snapshot mới vào `projects` (khác cách làm quen thuộc từ trước) — vì `project.hasCharacters` cố định vĩnh viễn sau khi tạo (mục 6.5), chỉ đúng 1 trong 2 template scene generation của channel bao giờ áp dụng cho 1 project, nên `resolvePipelineRuntime()` chọn sẵn đúng chuỗi trước khi đưa vào `promptSettings.sceneGeneration` — mọi nơi khác (PipelineService, snapshot có sẵn `scene_generation_prompt_snapshot`) không cần biết có 2 template, giữ nguyên gần như không đổi gì.
+
+**Ghi chú hoàn thành (2026-08-11):**
+- **Migration `0007_add_scene_generation_prompt_no_characters`** — 1 cột `TEXT NOT NULL DEFAULT '<default prompt text>'` trên `channels`, backfill bằng prompt mặc định thật (không phải chuỗi rỗng), cùng kỹ thuật escape SQL string như `0004_add_channels`.
+- **`DEFAULT_SCENE_GENERATION_NO_CHARACTERS_PROMPT`** (`src/shared/prompts.ts`) — cùng cấu trúc panel/JSON output với prompt gốc, bỏ hết rule liên quan nhân vật (Character ID/Visual DNA format, 2 placeholder `{{RELEVANT_CHARACTERS}}`/`{{RELEVANT_CHARACTER_PROMPTS}}`), tập trung mô tả bối cảnh/ánh sáng/thời tiết/góc máy. `REQUIRED_PLACEHOLDERS.sceneGenerationNoCharacters` chỉ còn `{{BLOCK_NUMBER}}`/`{{SRT_TEXT}}`.
+- **`resolvePipelineRuntime()`** (`src/main/pipelineRuntime.ts`) chọn `channel.sceneGenerationPrompt` hay `channel.sceneGenerationPromptNoCharacters` dựa vào `project.hasCharacters`, gán thẳng vào `promptSettings.sceneGeneration` — điểm resolve duy nhất trong toàn bộ pipeline.
+- **`validateProjectForRun()`** (`src/shared/validateRun.ts`) kiểm tra `promptSettings.sceneGeneration` theo đúng bộ placeholder tương ứng (`sceneGeneration` hay `sceneGenerationNoCharacters`) tuỳ `project.hasCharacters`.
+- **Bug tự phát hiện + tự fix trước khi báo xong** (không có trong yêu cầu ban đầu, phát hiện lúc rà lại toàn bộ chỗ dùng `getMissingPlaceholders('sceneGeneration', ...)`): `ScenePromptService.generate()`/`retry()` có 1 guard validate placeholder độc lập, hard-code key `'sceneGeneration'` — nếu bỏ sót, guard này tự chặn **mọi** prompt "No Characters" hợp lệ (báo thiếu 2 placeholder nhân vật mà thiết kế mới không cần), làm hỏng hẳn pipeline cho channel "No Characters" ngay khi channel đó có prompt riêng. Sửa bằng cách chọn key theo `project.hasCharacters`, giống `validateProjectForRun`. Có unit test riêng (`scenePromptService.test.ts`) xác nhận `generate()` chạy được với template chỉ có `{{BLOCK_NUMBER}}`/`{{SRT_TEXT}}` khi `hasCharacters=false`.
+- **Bug tiềm ẩn khác tự phát hiện** (electron-store): `conf` (nền của `electron-store`) chỉ shallow-merge `defaults` vào file JSON đã tồn tại (`Object.assign`, không deep merge) — user nâng cấp từ bản cũ có `app-settings.json` sẵn sẽ thiếu hẳn `promptSettings.sceneGenerationNoCharacters` trên đĩa. Sửa `getAppSettings()` (`src/main/appSettingsStore.ts`) spread `DEFAULT_SETTINGS.promptSettings` trước rồi mới ghi đè giá trị thật đã lưu — tự vá cho field mới này lẫn field tương lai thêm sau.
+- **UI:** `PromptsSettingsPage.tsx` (Settings > Prompts) thêm card thứ 4 "Scene / Image Generation (No Characters)", tái dùng nguyên `PromptEditorCard` (đã generic theo `PromptKey`, không sửa file đó). `ChannelForm.tsx` đổi cách hiện — thay vì luôn hiện đúng 1 card "Scene / Image Generation Prompt" như trước, giờ hiện **đúng 1 trong 2 card** tuỳ checkbox "Has Story Characters" (khác 2 card Character Detection/Generation ở Phase 21 vốn chỉ ẩn hẳn không có card thay thế).
+- **`ChannelService`/`channels.queries.ts`/`entities.ts`/`channel.schema.ts`/`NewChannelPage.tsx`/`EditChannelPage.tsx`** — thêm field `sceneGenerationPromptNoCharacters` xuyên suốt, cùng pattern các field channel khác (required, copy 1 lần lúc tạo project — thực chất chỉ "copy" gián tiếp qua `resolvePipelineRuntime()` vì không có cột project riêng, xem quyết định thiết kế ở trên).
+- **Verify:** `tsc --noEmit` sạch cả 3 tsconfig, `eslint` sạch. `vitest` 309 (baseline Phase 21) → **321/321 pass** — thêm 2 test `prompts.test.ts`, 3 test `channelService.test.ts`, 2 test `migrations.test.ts` (`0007`), 2 test `validateRun.test.ts`, 1 test `scenePromptService.test.ts` (test then-fix cho bug guard `getMissingPlaceholders` ở trên), cộng 1 fix bắt buộc cho `exportService.test.ts` (object `channelService.create()` cũ thiếu field mới, đã throw runtime nếu không sửa — không phải lỗi TypeScript vì `tests/` không nằm trong 3 tsconfig chính, chỉ lộ ra khi chạy thật).
+- Chưa có bằng chứng end-to-end với Electron app thật — cần user tự mở app sau khi build lại để xác nhận: Settings > Prompts có đủ 4 card; tạo/sửa Channel tắt "Has Story Characters" → card Scene/Image Generation đổi thành bản "(No Characters)"; Run All cho project thuộc channel đó → Image Prompts tab ra prompt đúng theo template mới (mô tả bối cảnh, không có dòng `@Character_ID [...]` nào).
+
+**Addendum (2026-08-11) — thay nội dung `DEFAULT_SCENE_GENERATION_NO_CHARACTERS_PROMPT` theo art-direction spec do user cung cấp:** phong cách nghệ thuật Nhật Bản cổ điển (Ukiyo-e/Sumi-e — mực trên giấy Washi/lụa, Ki/Tanden/Kintsugi, Kanji/Hanko/Seigaiha, tông Wabi-sabi), góc quay/cường độ suy ra theo cảm xúc chủ đạo của từng block (sad/tense/excited/neutral/wide — không có field emotion riêng trong schema, LLM tự suy luận từ nội dung SRT), khung 9:16, tối đa 120 từ, tự đủ nghĩa. **Không phải schema/migration change** — chỉ đổi nội dung hằng số `DEFAULT_SCENE_GENERATION_NO_CHARACTERS_PROMPT` (`src/shared/prompts.ts`); migration `0007` import thẳng hằng số này (`escapeSqlString(DEFAULT_SCENE_GENERATION_NO_CHARACTERS_PROMPT)`) nên tự động dùng bản mới — không cần sửa/thêm migration. Vẫn giữ nguyên 2 placeholder bắt buộc `{{BLOCK_NUMBER}}`/`{{SRT_TEXT}}` và JSON output contract `{"scene_prompts":[...]}`. Bỏ hẳn phần "nếu có CHARACTER thì copy nguyên văn consistency_prompt" trong spec gốc của user vì chế độ No Characters không có nguồn dữ liệu đó (không có Character Database/`consistency_prompt` field trong app) — thay bằng mô tả chủ thể ẩn danh, không cần nhất quán danh tính giữa các block. **Lưu ý:** nếu app đã từng chạy migration `0007` trước lần sửa này (đã tạo channel/mở Settings > Prompts trước đó), channel đã tồn tại sẽ giữ nguyên bản backfill cũ cho tới khi bấm "Reset to Default" trên card đó — Reset to Default và channel mới tạo sau thời điểm này đều lấy đúng bản mới. `tsc`/`eslint` sạch sau khi sửa (không đổi cấu trúc code, chỉ đổi nội dung chuỗi).
+
+---
+
+## Phase 23 — Post-V1: Activation Code (khoá theo máy)
+
+Ngoài phạm vi V1 gốc — yêu cầu trực tiếp của user: kiểm soát việc cài app lên máy khác bằng 1 "activation code" giống password, mỗi code chỉ hợp lệ đúng 1 máy (dùng ở máy này rồi thì máy khác không nhập được).
+
+**Không phải server/online activation** — app không có backend, nên dùng cơ chế offline: code là chữ ký Ed25519 (Node `crypto` built-in) ký lên "Machine ID" của máy đích, bằng 1 private key chỉ developer giữ (không nằm trong bản build). App chỉ nhúng public key (an toàn khi lộ vì không tạo được code mới từ đó) để verify local, không cần internet/server tracking. "1 code chỉ dùng đúng 1 máy" là hệ quả toán học của chữ ký số, không phải giới hạn áp đặt thủ công.
+
+**Không phải schema change** — activation là state cấp "bản cài đặt trên máy" (giống việc đã cấu hình Vilao API key hay chưa), không phải dữ liệu quan hệ theo project — lưu file phẳng `activation.json` trong `userData`, không qua SQLite/`schema.md`, cùng pattern `vilao.cred`/`SecureStorageService` đã có từ Phase 3 (khác ở chỗ không cần `safeStorage` mã hoá, vì đây là dữ liệu cần chống giả mạo chứ không cần giữ bí mật — chữ ký Ed25519 đã tự lo việc chống giả mạo).
+
+**Việc cần làm:**
+- `scripts/generate-activation-keypair.cjs` + `scripts/generate-activation-code.cjs` — 2 script CLI offline, chạy tay bởi developer, không import bởi bất kỳ file nào trong `src/` (không lọt vào `out/`/bản build). Sinh keypair 1 lần (private key gitignored), sinh code cho từng máy theo yêu cầu (`--machine-id <id>`).
+- `src/shared/activationPublicKey.ts` — public key PEM nhúng cứng.
+- `src/main/services/ActivationService.ts` — `getMachineId()` (qua `node-machine-id`), `getStatus()`, `activate(code)`; verify lại chữ ký với Machine ID hiện tại mỗi lần gọi (không tin field lưu trong file) để chặn việc copy `activation.json` sang máy khác.
+- IPC domain `activation` mới (`ipc-channels.ts`/`ipc-types.ts`/`src/main/ipc/activation.ipc.ts`/preload) — theo đúng khuôn các domain đã có (`vilao.ipc.ts` làm mẫu).
+- `src/renderer/App.tsx` chặn `RouterProvider` bằng 1 màn `ActivationGate` full-screen mới cho tới khi `activation.getStatus()` trả `activated: true` — chỉ chặn ở Renderer, không chặn thêm ở từng IPC handler (đã cân nhắc và chấp nhận đánh đổi này với user — đủ cho mục đích kiểm soát cài đặt thông thường, không phải chống crack chuyên nghiệp).
+
+**Test + chạy local:**
+1. `npm run generate-activation-keypair` → dán public key vào `activationPublicKey.ts`.
+2. `npm run dev` → thấy màn Activation Gate (chưa có `activation.json`), copy đúng Machine ID hiển thị.
+3. `npm run generate-activation-code -- --machine-id <id>` → dán vào Gate → unlock vào app.
+4. Tắt mở lại app → vào thẳng app, không hiện lại Gate.
+5. Dán code sinh cho 1 machine-id giả vào 1 profile `userData` sạch → bị từ chối đúng thông báo "không hợp lệ cho máy này".
+6. Sửa tay `activation.json` thành chuỗi hỏng trong lúc đã activated → mở lại app → quay lại Gate, không crash.
+7. `npm run dist` (build Windows) → cài thử, lặp lại bước 2-4 trên bản đóng gói thật.
+
+**Ghi chú hoàn thành:** cặp khoá Ed25519 thật đã sinh (`npm run generate-activation-keypair`), public key đã nhúng vào `activationPublicKey.ts`. Verify: `vitest` (6 test `activationService.test.ts`, mock `electron`/`node-machine-id`, dùng keypair test riêng) pass; chạy `node-machine-id` thật trên máy dev lấy đúng Machine ID thật; sinh code thật cho Machine ID đó bằng CLI, verify độc lập bằng script tái hiện đúng thuật toán → hợp lệ đúng máy, bị từ chối với machine ID khác/chuỗi rác; `npm run dev` thật + chụp màn hình xác nhận Activation Gate hiện đúng (Machine ID thật, đúng style DESIGN.md, không crash). Chưa tự động hoá được bước click "Activate" trong UI thật (thử bằng PowerShell mouse automation nhưng lệch toạ độ, click nhầm sang cửa sổ khác trên desktop — bỏ cách này) — để user tự dán code test nốt bước cuối. `tsc`/`eslint` sạch, `vitest` 322/322 (baseline Phase 22 316 → +6).
+
+---
+
+## Phase 24 — Post-V1: Export thêm `character_list.txt`
+
+Ngoài phạm vi V1 gốc — yêu cầu trực tiếp của user: export thêm 1 file liệt kê tên toàn bộ nhân vật (Character ID, bỏ tiền tố `@`), mỗi dòng 1 nhân vật, không cách dòng trống.
+
+Chỉ ghi file này khi project có ít nhất 1 nhân vật (`characters.length > 0`) — project channel "No Characters" (Phase 21) không có gì để liệt kê nên không tạo file rỗng, khác 2 file kia (luôn ghi, kể cả rỗng).
+
+**Việc cần làm:**
+- `formatCharacterListFile()` (`src/shared/exportFormat.ts`) — liệt kê toàn bộ Character Database (không lọc theo prompt thành công hay không, khác `character_prompts.txt`), theo đúng thứ tự `characters` (created_at ASC).
+- `ExportService.export()` — ghi thêm `character_list.txt` có điều kiện.
+- `ExportPage.tsx` (Renderer preview) — thêm dòng trong cây thư mục + 1 Card preview, cùng điều kiện `characters.length > 0`, dùng chung `formatCharacterListFile()` nên không lệch với file thật.
+
+**Ghi chú hoàn thành:** `tests/unit/exportFormat.test.ts`/`exportService.test.ts` cập nhật/thêm case cho file mới. `vitest` 323/323, `tsc --noEmit` sạch, `eslint` sạch.
+
+---
+
+## Phase 25 — Post-V1: Multi-provider API key (Vilao + DeepSeek + Gemini)
+
+> **Trạng thái: hoàn thành** (user duyệt toàn bộ khuyến nghị: Phương án A, SecureCredential 1 file/provider, Gemini qua OpenAI-compatible, tab "API Keys").
+
+Ngoài phạm vi V1 gốc — yêu cầu trực tiếp của user: ngoài Vilao API key, cho phép lưu thêm API key của **DeepSeek** và **Gemini**, và dùng model của các provider đó để chạy pipeline.
+
+### Hiện trạng (đã đọc code)
+
+- `VilaoService` (`src/main/services/VilaoService.ts`) thực chất là client OpenAI-compatible (`GET /models`, `POST /chat/completions`, Bearer auth); `baseUrl` đã là option của constructor. DeepSeek và Gemini đều có endpoint OpenAI-compatible nên **không cần viết client mới từ đầu** — chỉ cần chọn base URL + chuẩn hoá khác biệt lỗi/model id.
+- `SecureStorageService` hard-code 1 file `vilao.cred`; `saveApiKey/getApiKey/hasApiKey/clear` không có tham số provider.
+- IPC domain `vilao.*` (`vilao.ipc.ts`, `ipc-channels.ts`, `ipc-types.ts`, `preload`) — 5 method, chỉ biết 1 key.
+- Model được chọn **theo channel** (`channels.selected_model`, Phase 17/18), snapshot vào `projects.selected_model_snapshot` khi Run đầu tiên. Cột này chỉ là 1 chuỗi `model_id`, chưa có khái niệm provider.
+- Nơi tạo `VilaoService` từ key: `pipelineRuntime.ts` (Run All / Queue) và `projects.ipc.ts` `resolveChannelVilaoRuntime()` (Detect/Generate thủ công). Nơi check key tồn tại: `validateProjectForRun` (`shared/validateRun.ts`) qua `TopBar.tsx` + `ProcessingPage.tsx`. Nơi list model: `ChannelForm.tsx` (`appApi.vilao.listModels()`) + `VilaoApiSettingsPage.tsx`.
+- `errorClassification.ts` map lỗi theo `VilaoApiError.status` (401 → `INVALID_API_KEY`, v.v.).
+
+### Open Decisions (cần user chốt trước khi code)
+
+1. **Cách gắn provider vào model của channel** — đây là quyết định chính:
+   - **Phương án A (khuyến nghị, không đổi schema):** lưu `selected_model` dạng `"<provider>:<modelId>"` cho provider mới (`deepseek:deepseek-chat`, `gemini:gemini-2.5-flash`); chuỗi **không có tiền tố = Vilao** (tương thích ngược 100% với channel/project cũ và snapshot cũ, không cần migration). Snapshot `selected_model_snapshot` tự mang theo provider nên Resume/Retry không đổi provider giữa chừng. UI luôn hiển thị tên model đã bỏ tiền tố + badge provider. Nhược điểm: provider "ẩn" trong chuỗi, phải qua 1 helper `parseModelRef()` duy nhất.
+   - **Phương án B (chuẩn hoá, đổi schema):** thêm `channels.provider` + `projects.selected_provider_snapshot` qua migration `0008`. Sạch hơn nhưng là **schema change** → theo CLAUDE.md phải hỏi và được duyệt, rồi ghi Changelog trong schema.md.
+2. **`SecureCredential` trong schema.md** đang ghi `provider: "vilao"`. Triển khai thật đã bỏ `provider`/`updatedAt` (chỉ raw bytes trong `vilao.cred`). Đề xuất: giữ nguyên cách lưu, thêm 2 file `deepseek.cred`, `gemini.cred` (mỗi provider 1 file) và **cập nhật mô tả** `SecureCredential` trong schema.md + Changelog. Đây là Non-DB shape, vẫn cần user đồng ý vì là sửa schema.md.
+3. **Gemini qua endpoint OpenAI-compatible hay native `generateContent`?** Khuyến nghị OpenAI-compatible (`https://generativelanguage.googleapis.com/v1beta/openai`) để dùng chung client; native API khác hẳn format request/response, tốn công gấp nhiều lần mà pipeline không cần tính năng riêng nào của nó.
+4. **Tên tab Settings:** đổi "Vilao API" → "API Keys" (3 card: Vilao / DeepSeek / Gemini) hay thêm 2 tab riêng? Khuyến nghị 1 tab "API Keys", tái dùng đúng layout card hiện có (không có screen Stitch cho phần này → không bịa style mới; nếu cần layout mới thì `edit_screens` trên "Settings - StoryPrompt" theo quy trình Stitch).
+5. **`AppSettings.selectedModel` (global)** còn được `TopBar`/`ProcessingPage` truyền vào `validateProjectForRun`, trong khi runtime thật đã lấy model từ channel (Phase 18). Cần kiểm tra lại trong phase này: validation phải dựa vào **model của channel** + key của **provider của model đó**; không thêm field nào vào `AppSettings` (đó cũng là schema change).
+
+### Việc cần làm (sau khi chốt Open Decisions; giả định Phương án A)
+
+**Main Process**
+- `src/shared/llmProviders.ts` (mới): `type LlmProvider = 'vilao' | 'deepseek' | 'gemini'`, metadata (label, `baseUrl`), `parseModelRef(str) → { provider, modelId }`, `formatModelRef(provider, modelId)`, `getProviderLabel()`. Một nguồn duy nhất cho cả Main và Renderer (cùng lý do `validateRun.ts`/`prompts.ts` nằm trong `shared/`).
+- `SecureStorageService`: thêm tham số `provider` cho `saveApiKey/hasApiKey/getApiKey/clear` → file `<provider>.cred`. Vilao giữ nguyên `vilao.cred` (key đã lưu không mất).
+- Client: dùng lại lớp OpenAI-compatible hiện có với `baseUrl` theo provider; thêm factory `createLlmService(provider, apiKey)` ở 1 chỗ để `pipelineRuntime.ts` + `projects.ipc.ts` + `vilao.ipc.ts` cùng dùng. **Giữ nguyên tên class `VilaoService`/`VilaoApiError` ở bước này** (đổi tên chỉ là diff lớn không mang giá trị; có thể để follow-up) nhưng sửa comment/thông báo lỗi cho không còn ghi cứng "Vilao" khi provider khác.
+- Khác biệt theo provider cần xử lý trong lớp client/`errorClassification.ts`:
+  - **DeepSeek**: base `https://api.deepseek.com`; model chat `deepseek-chat`, `deepseek-reasoner`; `402 Insufficient Balance` → map thành lỗi rõ ràng (hết credit), không retry vô ích; 401 → `INVALID_API_KEY`; giới hạn context nhỏ hơn → map `CONTEXT_TOO_LARGE` (Character Detection gửi cả transcript).
+  - **Gemini**: base `https://generativelanguage.googleapis.com/v1beta/openai`; `GET /models` trả id dạng `models/gemini-...` → chuẩn hoá bỏ tiền tố `models/` và lọc bỏ model không phải chat (embedding, imagen...); key sai có thể trả **400** (không phải 401) và body có thể là mảng `[{error}]` → `extractErrorInfo` phải chịu được cả 2 dạng, và test connection phải map đúng sang `Invalid`; 429 free-tier RPM thấp → kiểm tra backoff/`scene_concurrency` mặc định hiện có xử lý được (không đổi default nếu không cần).
+  - **Trước khi code**: đối chiếu lại docs chính thức của DeepSeek và Gemini (base URL, tên model, định dạng lỗi) bằng Context7/tra docs — các chi tiết trên là giả định từ hiểu biết hiện tại, chưa verify trong repo.
+- IPC: thay domain `vilao.*` bằng domain `providers.*` nhận tham số `provider` (`saveApiKey`, `testConnection`, `listModels`, `hasApiKey`, `clearApiKey`); cập nhật `ipc-channels.ts`, `ipc-types.ts`, `preload/index.ts`, tạo `providers.ipc.ts` thay `vilao.ipc.ts`. `listModels` trả model đã gắn sẵn provider để Renderer không tự ghép chuỗi.
+- `pipelineRuntime.ts` + `projects.ipc.ts`: parse `channel.selectedModel` → chọn provider → lấy đúng key → tạo đúng client; thiếu key của provider đó → `hasApiKey=false` để `validateProjectForRun` báo thông báo thân thiện (không throw chung chung).
+
+**Shared**
+- `validateProjectForRun`: nhận thêm provider của model (hoặc `hasApiKey` đã tính theo provider) và đổi thông báo thành `Configure and save a {Provider} API key in Settings > API Keys first.` Cập nhật test liên quan.
+
+**Renderer** (Tailwind only, lucide-react, RHF + Zod, theo DESIGN.md — không bịa token mới)
+- Settings > API Keys: 3 card cùng 1 component `ProviderKeyCard` (rút từ `VilaoApiSettingsPage.tsx`): password input + Save (tự Test Connection) + Remove + 5 trạng thái + Refresh Models. Giữ hành vi "đã lưu key → input disabled, chỉ còn Remove" và "đổi key → clear model list".
+- Zod schema key dùng chung (mở rộng `vilaoSettings.schema.ts` → `providerKey.schema.ts`).
+- `ChannelForm.tsx`: dropdown model gom nhóm theo provider (`<optgroup>`), chỉ liệt kê provider đã có key; nếu channel đang chọn model của provider đã bị xoá key → hiển thị cảnh báo thay vì im lặng reset.
+- `ChannelsPage`, `TopBar`, `OverviewPage`: hiển thị model đã bỏ tiền tố + nhãn provider (qua `parseModelRef`). `StatusBar` hiện hard-code "Vilao: Not configured" — đổi thành trạng thái tổng hợp các provider.
+- Router: giữ `/settings/vilao-api` redirect sang route mới để không vỡ link/điều hướng cũ.
+
+### Test + chạy local
+
+Unit (`vitest`):
+1. `parseModelRef/formatModelRef`: chuỗi không tiền tố → vilao; `deepseek:x`, `gemini:x`; model id chứa dấu `:` không bị cắt sai.
+2. Client với `global.fetch` mock cho từng provider: map response, 401 (Vilao/DeepSeek), 400-key-sai (Gemini), 402 (DeepSeek), body lỗi dạng mảng, chuẩn hoá `models/` prefix + lọc model không phải chat.
+3. `SecureStorageService`: ghi/đọc/xoá độc lập theo provider (mock `electron`), xoá key A không ảnh hưởng key B.
+4. `validateProjectForRun`: thiếu key đúng provider của model → đúng thông báo.
+5. Regression: toàn bộ test cũ (baseline `vitest` 323/323) vẫn pass; `tsc --noEmit` + `eslint` sạch.
+
+Thủ công (`npm run dev`, user tự test — không dùng Playwright tự launch app thật, theo bài học Phase 3):
+1. Settings > API Keys: lưu key từng provider → Connected + load danh sách model thật; key sai → Invalid; không có mạng → Error.
+2. Tạo/sửa channel, chọn model của DeepSeek; chạy 1 project nhỏ end-to-end (Detect → Character Prompts → Scene Prompts) → ra kết quả đúng format JSON, export bình thường.
+3. Lặp lại với Gemini.
+4. Channel cũ đang dùng Vilao (model không tiền tố) vẫn chạy y như trước, không cần sửa gì.
+5. Xoá key DeepSeek khi channel đang dùng model DeepSeek → Run All bị chặn với thông báo đúng; Vilao không bị ảnh hưởng.
+6. Kiểm tra `userData`: 3 file `*.cred` là bytes mã hoá, không thấy chuỗi key đọc được.
+
+**Ghi chú triển khai (code xong, chưa test tay):**
+- `src/shared/llmProviders.ts` mới: `LlmProvider`, metadata (label/baseUrl/placeholder), `parseModelRef/formatModelRef/formatModelDisplay`. Quy ước model: bare = Vilao, `deepseek:`/`gemini:` prefix cho provider khác (Phương án A, không migration).
+- `VilaoService` giữ tên class nhưng nhận `provider` (mặc định vilao → test/caller cũ không đổi). `listModels()` trả id đã ở dạng channel; Gemini bỏ tiền tố `models/` và lọc embedding/image/tts...; `chat()` tự bỏ tiền tố provider khỏi `model` nên pipeline/service không phải sửa. Gemini 400 "API key not valid" → chuẩn hoá thành 401; body lỗi dạng mảng được chấp nhận. Thông báo lỗi dùng tên provider; `errorClassification` so khớp `endsWith('returned an empty response')`.
+- `SecureStorageService`: `<provider>.cred`, tham số provider mặc định vilao. IPC `vilao.*` → `providers.*` (`providers.ipc.ts`, `ipc-channels.ts`, `ipc-types.ts`, preload). `pipelineRuntime.ts` + `projects.ipc.ts` chọn key/client theo provider của model channel.
+- `validateProjectForRun`: thông báo nêu đúng provider ("Configure and save a DeepSeek API key in Settings > API Keys first."). Quyết định #5: `TopBar`/`ProcessingPage` trước đây validate bằng `AppSettings.selectedModel` global (đã lỗi thời từ Phase 18) → thay bằng `lib/runValidation.ts` dùng model của project snapshot/channel + key đúng provider. `AppSettings.selectedModel` không còn được UI ghi.
+- Renderer: tab "API Keys" (`apiKeys/ApiKeysSettingsPage.tsx` + `ProviderKeyCard.tsx`, route `/settings/api-keys`, `/settings/vilao-api` redirect). Card không còn dropdown model (model chọn theo channel), chỉ hiện số model + Refresh. `ChannelForm` gom model theo provider (`optgroup`), chỉ provider có key; model của provider đã mất key vẫn hiện kèm cảnh báo. Model hiển thị qua `formatModelDisplay` ở Channels/Overview/TopBar. Bỏ dòng "Vilao: Not configured" cứng trong `StatusBar`.
+- Test: `tests/unit/llmProviders.test.ts` mới (12 test). `vitest` 340/340, `tsc` (3 config) và `eslint` sạch. Chưa có unit test cho `SecureStorageService` theo provider (module phụ thuộc `electron`/`safeStorage`, cần mock — chưa làm).
+- **Chưa verify với API thật** (base URL/lỗi DeepSeek & Gemini dựa trên hiểu biết hiện tại) — cần user nhập key thật và chạy các bước "Thủ công" bên dưới.
+
+**Điểm dừng:** 3 provider cấu hình + chạy pipeline được end-to-end, key không plaintext, channel/project cũ không bị ảnh hưởng. Dừng, chờ user xác nhận rồi mới tick `[x]` và ghi "Xác nhận bởi user" như các phase trước.
+
+
+**Xác nhận bởi user (2026-10-20):** đã xác nhận hoàn thành giai đoạn này.
+
+---
+
+## Phase 26 — Post-V1: Thinking level (DeepSeek + Gemini)
+
+Yêu cầu trực tiếp của user: đọc docs DeepSeek/Gemini, model nào có thinking thì thêm option chọn. Lưu mức thinking bằng cách **encode vào chuỗi model** (user chọn, không schema change): `[<provider>:]<modelId>[@<level>]`, vd `deepseek:deepseek-flash@high`; không có `@` = mặc định của model. Level hợp lệ: `off|low|medium|high|max`; hậu tố lạ bị bỏ qua (id model chứa `@` khác vẫn nguyên vẹn).
+
+**Docs đã đọc (2026-10-20):** api-docs.deepseek.com/guides/thinking_mode, ai.google.dev/gemini-api/docs/openai và /thinking.
+- **DeepSeek** (`deepseek-flash`, `deepseek-v4-pro`): bật/tắt bằng `thinking: {type: enabled|disabled}` (mặc định bật), mức bằng `reasoning_effort` low/high/max (mặc định high; medium→high). Thinking mode bỏ qua `temperature`. UI cho: Off / Low / High / Max.
+- **Gemini** (OpenAI-compat): `reasoning_effort` minimal/low/medium/high; `"none"` (tắt) chỉ chạy trên 2.5 (không phải Pro) — "không tắt được thinking của 2.5 Pro và Gemini 3". UI: 2.5 Flash/Flash-Lite → Off/Low/Medium/High; 2.5 Pro → Low/Medium/High; Gemini 3+/4 → Low/Medium/High, riêng bản Pro của 3 → Low/High. Không dùng `minimal` (không phải model nào cũng có) và không có Max.
+- **Vilao**: không có docs → không hiện option, không gửi gì.
+
+**Đã làm:**
+- `src/shared/llmProviders.ts`: `ThinkingLevel`, `parseModelRef` (thêm `thinking`), `formatModelRef(provider, id, thinking?)`, `stripThinking`, `getThinkingOptions(provider, modelId)`, `buildThinkingParams(...)`; `formatModelDisplay` hiện "(DeepSeek · thinking high)".
+- `VilaoService.chat()`: tách id + level, gửi `reasoning_effort` / `thinking` top-level (tương đương `extra_body` của OpenAI SDK). Level không hợp lệ với model (vd Off cho 2.5 Pro) bị bỏ thay vì gây 400.
+- `ChannelForm`: dropdown model làm việc trên ref không có hậu tố; thêm dropdown **Thinking** (ẩn nếu model không hỗ trợ), đổi model thì giữ level nếu model mới hỗ trợ.
+- `tests/unit/llmProviders.test.ts`: +5 test (17 tổng cho file). `tsc` 2 config + `eslint` sạch.
+
+**Lưu ý / chưa verify:** chưa gọi API thật. Tên model Gemini 3/4 trong bảng options dựa vào pattern `gemini-2.5` / `gemini-3|4` + `pro` — model mới đặt tên khác sẽ không hiện option Thinking (an toàn, chỉ là thiếu option). `npm test` đầy đủ chưa chạy lại lần này vì `better-sqlite3.node` đang bị khoá (app dev đang chạy) — chạy lại sau khi tắt app; các test không cần SQLite đã pass.
+
+**Test tay:** chọn model DeepSeek trong channel → xuất hiện dropdown Thinking; đặt Off rồi chạy 1 project nhỏ (nhanh hơn rõ), đặt Max (chậm hơn); Gemini 2.5 Flash thử Off; 2.5 Pro không có Off; model Vilao không có dropdown; channel cũ không đổi hành vi.
+
+
+**Xác nhận bởi user (2026-10-20):** đã xác nhận hoàn thành giai đoạn này.
+
+---
+
+## Phase 27 — Post-V1: Tab "API Calls" (đếm số lần project gọi model)
+
+Yêu cầu trực tiếp của user: mỗi project có 1 tab theo dõi project đó gọi model bao nhiêu lần. User chọn: **bảng mới `llm_calls`** (đếm chính xác, schema change đã duyệt) + tab hiển thị **tổng + theo bước + danh sách gần nhất**.
+
+**Đã làm:**
+- Migration `0008_add_llm_calls` (bảng `llm_calls`, FK cascade theo project, index theo project) + `llmCalls.queries.ts`, `LlmCallService` (`record()` không bao giờ throw; `getStats()`), entity `LlmCall`, type `LlmCallStats` (ipc-types). Ghi chú schema trong schema.md.
+- `VilaoService.chat()` nhận `meta: {projectId, step}`; khi có `meta` và service có `onCall`, mỗi request (thành công hay lỗi, mỗi retry là 1 lần) được báo về kèm thời gian + `usage` token nếu provider trả. Lỗi của logger bị nuốt, không phá pipeline. 4 điểm gọi (Detect Characters, Character Prompts, Select Relevant Characters, Scene Prompts) truyền `meta`; nơi tạo `VilaoService` (`pipelineRuntime.ts` cho Run All/Queue, `projects.ipc.ts` cho thao tác thủ công) gắn `createLlmCallRecorder()` (ghi DB + broadcast `llmCalls:changedEvent`).
+- IPC `llmCalls.stats(projectId)` + `llmCalls.onChanged(cb)` (preload/channels/types).
+- Tab **API Calls** (sidebar sau Processing, route `api-calls`, `features/apiCalls/ApiCallsPage.tsx`): thẻ tổng (calls/thành công/lỗi %/thời gian, + token nếu có), bảng theo bước pipeline, bảng theo model (hiện cả mức thinking), 200 call gần nhất (giờ, bước, model, kết quả/lỗi, thời lượng, token). Refetch debounce 400ms khi có call mới nên cập nhật live cả với run từ Queue. Chỉ dùng token/component có sẵn (Card, EmptyState, font/colour token), không có screen Stitch cho tab này.
+- Test: `tests/unit/llmCallService.test.ts` (8 test: thống kê, tách theo project, cascade, không throw, hook `onCall` thành công/lỗi/không có meta/logger lỗi); sửa 1 test cũ của `characterService` vì `chat()` giờ nhận thêm `meta`. `vitest` 353/353 (chạy bằng Electron-as-Node vì `better_sqlite3.node` đang bị app dev khoá), `tsc` + `eslint` sạch.
+
+**Lưu ý:**
+- Chỉ có số liệu từ lúc cập nhật trở đi — project đã chạy trước đó hiện "No model calls yet".
+- Token chỉ hiện nếu API trả `usage`; DeepSeek/Gemini (OpenAI-compat) thường có, chưa verify với API thật.
+- "Failed" là lỗi ở mức request (mạng, 4xx/5xx, response rỗng). Response về nhưng JSON sai vẫn tính là call thành công (retry sau đó là 1 call mới).
+
+**Test tay:** chạy 1 project nhỏ → mở tab API Calls, số call tăng live; cố tình dùng key sai/hết hạn để thấy call failed + thông báo lỗi; đổi model giữa 2 channel để thấy bảng theo model; xoá project → dữ liệu mất cùng project.
+
+
+**Xác nhận bởi user (2026-10-20):** đã xác nhận hoàn thành giai đoạn này.
+
+---
+
+## Phase 28 — Post-V1: Tối ưu gọi API (độ ổn định + chi phí/tốc độ)
+
+> **Trạng thái: hoàn thành** (user bảo "thực hiện" 2026-10-20). Phạm vi do user chốt: mục 1–7 trong bản review gọi API (2026-10-20). **Không làm mục 8** (bỏ bước Relevant Character Selection / gửi full Character Database) — giữ nguyên spec.md 16/17.
+
+**Không có schema change.** Không thêm/đổi cột hay bảng nào. Mục 5 có 1 migration **chỉ đổi dữ liệu** (cập nhật prompt mặc định cho channel còn dùng nguyên bản cũ), cùng kiểu với `0007` — không phải thay đổi schema.
+
+### Bối cảnh (bằng chứng từ lần chạy thật, project "alo", `deepseek-v4-pro`)
+
+- 1 call Scene Prompts `terminated` (2m13s) làm fail cả batch scene 021–026 mà không có lần retry nào: `DEFAULT_MAX_RETRY = 1` (`ProjectService.ts`) nghĩa là mỗi batch chỉ được gửi đúng 1 lần.
+- Lỗi `terminated` xảy ra lúc đọc body → nằm ngoài `try` bắt lỗi mạng của `VilaoService.request()` nên bị phân loại `API_ERROR` thay vì `NETWORK_ERROR`; timeout 15s chỉ áp tới lúc có header, lúc đọc body không có giới hạn.
+- Relevant Character Selection: call ít suy luận chỉ ~2k token/15s, nhưng phần lớn call của bước này 12–15k token/2–3 phút → gần như toàn token thinking cho một việc phân loại đơn giản.
+- Prompt Scene mặc định đặt dữ liệu thay đổi (`{{SRT_TEXT}}`, nhân vật) ở giữa, ~30 dòng quy tắc cố định ở cuối → prefix cache của DeepSeek/Gemini gần như không ăn. Prompt selector nội bộ cũng đặt blocks trước Character Index.
+
+### Việc cần làm
+
+**1. Retry lỗi tạm thời ở tầng transport** (`VilaoService`)
+- `chat()` tự retry lỗi tạm thời: `NETWORK_ERROR` (gồm `terminated`/socket reset), `TIMEOUT`, `RATE_LIMIT` (429, tôn trọng header `Retry-After` nếu có), HTTP 5xx, `EMPTY_RESPONSE`. Tối đa **3 lần thử thêm**, backoff mũ có jitter (~2s → 4s → 8s, trần 30s). Độc lập với `project.maxRetry` (vẫn dùng cho lỗi nội dung/định dạng ở tầng service — logic chia đôi batch giữ nguyên).
+- **Không** retry: 401 (key sai), 402 (DeepSeek hết tiền), 400/422, `MODEL_NOT_AVAILABLE`, `CONTEXT_TOO_LARGE` (service tự xử lý bằng cắt context/chia batch như hiện tại).
+- Mỗi lần thử vẫn là 1 dòng riêng trong `llm_calls` (tab API Calls phản ánh đúng số request thật).
+- Huỷ được giữa các lần retry: `chat()` nhận `signal?: AbortSignal` tuỳ chọn; `ScenePromptService`/`CharacterService` truyền signal gắn với `shouldContinue`/xoá project (`PipelineService.stopAndWait`) để xoá project không phải chờ hết chuỗi retry.
+- Xem lại tương tác với backoff 429 dùng chung (`backoffState` trong `ScenePromptService`): 429 đã retry ở transport thì service không tự retry thêm cho cùng mã đó — tránh nhân đôi số lần.
+
+**2. Phân loại đúng lỗi khi đọc body**
+- Đưa phần đọc body (`response.json()` / đọc stream) vào cùng cơ chế bắt lỗi: `TypeError: terminated`, `AbortError`, lỗi undici (`UND_ERR_*`) → `VilaoApiError(status: null)` → `NETWORK_ERROR`/`TIMEOUT`, để đi vào đường retry của mục 1. Giữ message gốc (vd "terminated") để debug.
+
+**3. Streaming + idle timeout**
+- Gửi `stream: true` (SSE, OpenAI-compatible) cho DeepSeek và Gemini; ghép `delta.content` thành nội dung cuối, bỏ `delta.reasoning_content` (thinking) và dòng keep-alive (`: keep-alive`) của DeepSeek. Lấy `usage` từ chunk cuối (`stream_options: {include_usage: true}`) để tab API Calls vẫn có token.
+- Timeout mới: header ≤ 30s; **idle timeout 90s** (90s không nhận được byte nào → huỷ, coi là `TIMEOUT` → retry theo mục 1); trần tổng 10 phút/request. Thay cho timeout 15s cố định hiện tại.
+- **Vilao giữ non-stream** cho tới khi có docs xác nhận streaming (flag `supportsStreaming` trong `LLM_PROVIDER_META`), chỉ đổi timeout: header 30s + trần tổng 5 phút. `listModels()` giữ nguyên.
+- Trước khi code: đối chiếu docs chính thức của DeepSeek (streaming, keep-alive, `stream_options`) và Gemini OpenAI-compat (streaming, `usage` trong stream).
+
+**4. Thinking Off cho bước Relevant Character Selection**
+- Trong `selectRelevantCharactersBatch` (`ScenePromptService`), ép mức thinking thấp nhất model hỗ trợ, bất kể channel đặt gì: `off` nếu có (DeepSeek, Gemini 2.5 Flash/Flash-Lite), không có thì `low` (Gemini 2.5 Pro, Gemini 3/4); Vilao không gửi gì. Thêm helper `withMinimalThinking(modelRef)` cạnh `getThinkingOptions` trong `llmProviders.ts`.
+- Model/provider giữ nguyên như channel (không thêm setting mới). Các bước khác (Detect, Character Prompts, Scene Prompts) vẫn theo mức thinking của channel.
+
+**5. Prefix caching — đưa phần cố định lên đầu prompt**
+- **Prompt selector nội bộ** (`selectRelevantCharacters.ts`, user không sửa được): sắp lại thành hướng dẫn + định dạng output + `CHARACTER INDEX` (cố định trong cả project) trước, `BLOCKS` (đổi theo batch) ở cuối.
+- **Prompt Scene mặc định** (`DEFAULT_SCENE_GENERATION_PROMPT` và `DEFAULT_SCENE_GENERATION_NO_CHARACTERS_PROMPT` trong `src/shared/prompts.ts`): chuyển toàn bộ quy tắc/định dạng output lên trước, dồn các khối dữ liệu xuống cuối theo thứ tự ít đổi → hay đổi: `{{RELEVANT_CHARACTERS}}` → `{{RELEVANT_CHARACTER_PROMPTS}}` → `{{BLOCK_NUMBER}}` → `{{SRT_TEXT}}`. **Giữ nguyên nội dung quy tắc**, chỉ đổi thứ tự (và câu dẫn nếu cần cho mạch lạc).
+- Migration dữ liệu `0009_reorder_default_scene_prompts`: channel nào có prompt **trùng nguyên văn** bản mặc định cũ thì cập nhật sang bản mới; channel đã sửa tay thì giữ nguyên (user tự chuyển phần dữ liệu xuống cuối hoặc bấm Reset to Default nếu muốn). Không đụng `projects.*_prompt_snapshot` (CLAUDE.md: snapshot không bị ghi đè).
+- Character Detection/Generation: kiểm tra vị trí `{{TRANSCRIPT}}`/`{{CHARACTERS}}`; nếu đang ở giữa thì áp dụng cùng nguyên tắc (lợi ích nhỏ hơn vì mỗi project chỉ gọi 1–2 lần).
+
+**6. JSON mode**
+- Gửi `response_format: {type: "json_object"}` cho DeepSeek và Gemini (Vilao chưa có docs → không gửi). Mọi prompt đã yêu cầu "Chỉ trả về JSON" nên thoả điều kiện của DeepSeek (prompt phải chứa chữ "json").
+- Giữ nguyên `repairJsonText` + parser hiện tại làm lớp bảo vệ thứ hai. Docs DeepSeek cảnh báo JSON mode đôi khi trả content rỗng → đã có retry `EMPTY_RESPONSE` ở mục 1.
+- Trước khi code: xác nhận Gemini OpenAI-compat nhận `json_object` cùng lúc với streaming.
+
+**7. Song song các batch Character Prompts**
+- `CharacterService.generatePrompts` chạy các batch (10 nhân vật/batch) qua `runWithConcurrency` với mức song song = `project.sceneConcurrency` (đã có, không thêm setting), dùng chung backoff 429 như Scene. Mỗi batch vẫn ghi riêng nhân vật của nó, batch lỗi không ảnh hưởng batch khác.
+
+### Test + chạy local
+
+Unit (`vitest`, mock `fetch`):
+1. Transport retry: `terminated` khi đọc body → retry rồi thành công; lỗi liên tiếp hết lượt → throw `NETWORK_ERROR`; 401/402/400 không retry; 429 có `Retry-After` → đợi đúng; mỗi lần thử ghi 1 dòng `onCall`; abort giữa các lần retry → dừng ngay.
+2. Streaming: ghép nhiều chunk `delta.content`, bỏ `reasoning_content` và keep-alive, lấy `usage` từ chunk cuối; quá idle timeout → `TIMEOUT`; Vilao vẫn đi non-stream.
+3. `withMinimalThinking`: DeepSeek → `@off`, Gemini 2.5 Flash → `@off`, 2.5 Pro / Gemini 3 → `@low`, Vilao không đổi; selector gửi đúng tham số đó dù channel đặt `@max`.
+4. Prompt: selector có Character Index đứng trước BLOCKS; prompt mặc định mới vẫn đủ placeholder (`getMissingPlaceholders` rỗng); migration `0009` chỉ cập nhật channel trùng nguyên văn bản cũ, giữ channel đã sửa tay và mọi snapshot.
+5. `response_format` có cho DeepSeek/Gemini, không có cho Vilao.
+6. Character Prompts: nhiều batch chạy song song, batch lỗi không ảnh hưởng batch khác.
+7. Regression: toàn bộ test cũ pass; `tsc` + `eslint` sạch.
+
+Thủ công (user, `npm run dev`, key thật):
+1. Chạy lại project với `deepseek-v4-pro`: trên tab API Calls, call Relevant Character Selection còn khoảng vài nghìn token/dưới 30s thay vì 12–15k/2–3 phút.
+2. Ngắt mạng vài giây lúc đang chạy → thấy call lỗi rồi call retry thành công, không fail cả batch.
+3. So sánh tổng thời gian + token trước/sau trên cùng 1 transcript (tab API Calls).
+4. Gemini: chạy 1 project nhỏ, JSON mode + streaming không lỗi.
+5. Channel đã sửa prompt tay giữ nguyên; channel dùng mặc định nhận bản đã sắp lại.
+
+**Ghi chú triển khai:**
+
+Docs đã đối chiếu trước khi code: DeepSeek `create-chat-completion` (SSE, `stream_options.include_usage` → `usage` ở chunk cuối, `max_tokens` mặc định 64K ở thinking mode), `json_mode` (bắt buộc có chữ "json" trong prompt, có thể trả content rỗng), `rate_limit` (keep-alive: dòng trống khi non-stream, `: keep-alive` khi stream; server đóng kết nối nếu 10 phút chưa bắt đầu suy luận); Gemini `openai` (có streaming, có `include_usage`; **không** thấy nhắc `json_object`).
+
+- **Mục 1–3 — `VilaoService` viết lại phần chat:** `chat()` lặp tối đa `maxTransientRetries` lần thêm cho lỗi tạm thời (`isTransientError`: không có response/`terminated`/timeout/rỗng, 408, 429, 5xx); backoff mũ ±20% jitter từ `retryBaseDelayMs` (2s), trần 30s, ưu tiên `Retry-After` của 429. Mỗi lần thử ghi 1 dòng `llm_calls`. Mặc định của class là 0 retry (unit test thấy đúng 1 request); app tạo client qua `src/main/llmClient.ts` `createPipelineLlmClient()` (3 retry + recorder) ở cả `pipelineRuntime.ts` lẫn `projects.ipc.ts`. Settings > Test Connection không retry.
+  - Đọc body (JSON hoặc SSE) nằm trong cùng `try` → `terminated`/AbortError/lỗi undici ra `VilaoApiError(status: null)` → `NETWORK_ERROR`/`TIMEOUT`.
+  - Streaming (DeepSeek, Gemini — flag `supportsStreaming` trong `LLM_PROVIDER_META`): ghép `delta.content`, bỏ `reasoning_content`, comment keep-alive, dòng trống; xử lý dòng bị cắt giữa 2 chunk; `error` giữa stream → status 500 (retry được). Nếu server không trả `text/event-stream` thì đọc như JSON thường.
+  - **Khác plan:** idle timeout **180s** (không phải 90s) và tính từ lúc gửi request (thay cho timeout header riêng) — Gemini không có keep-alive nên model thinking có thể im lặng khá lâu trước chunk đầu; trần tổng 10 phút. Vilao (non-stream): 1 timeout tổng 5 phút cho cả header + body (trước đây 15s chỉ cho header). Chỉ `GET /models` còn dùng `timeoutMs` 15s.
+  - **Khác plan:** thay `AbortSignal` bằng `shouldContinue` trong `LlmRequest` — kiểm tra trước mỗi lần retry (Scene Prompts truyền `shouldContinue` của batch). Request đang chạy vẫn được chạy xong, đúng nguyên tắc spec.md 37.
+  - `errorClassification`: timeout nhận theo `startsWith('Request timed out')` (message giờ có thêm chi tiết).
+- **Mục 4:** `withMinimalThinking()` (`llmProviders.ts`) — selector gửi `@off` nếu model cho tắt, không thì `@low`; Vilao không đổi.
+- **Mục 5:** 4 prompt mặc định (`prompts.ts`) sắp lại: quy tắc/OUTPUT trước, dữ liệu cuối (`{{TRANSCRIPT}}`; `{{CHARACTERS}}`; Scene: khối "DỮ LIỆU CỦA BATCH NÀY" gồm nhân vật → reference → BLOCK → SRT). Nội dung quy tắc giữ nguyên, chỉ đổi câu dẫn "ở cuối prompt". Bản cũ nguyên văn ở `src/shared/legacyPrompts.ts` (`LEGACY_*_V1`, chỉ dùng để nhận diện). Migration dữ liệu `0009_reorder_default_prompts` (áp cho cả 4 cột prompt của `channels`, chỉ khi trùng nguyên văn bản cũ) + `appSettingsStore.getAppSettings()` đọc prompt global trùng bản cũ thành bản mới. Snapshot của project không đụng tới. Prompt selector nội bộ: hướng dẫn + format + Character Index trước, BLOCKS cuối. Thêm ghi chú ở spec.md mục 28.
+- **Mục 6:** `jsonMode: true` ở cả 4 bước pipeline → `response_format: json_object` **chỉ cho DeepSeek** (`supportsJsonMode`). **Khác plan:** Gemini chưa bật vì docs OpenAI-compat không xác nhận `json_object`.
+- **Mục 7:** `runWithConcurrency` tách ra `src/main/pipeline/concurrency.ts`; `CharacterService.generatePrompts` chạy batch song song theo `project.sceneConcurrency`. **Khác plan:** không chia sẻ trạng thái pause 429 giữa các batch nhân vật — 429 đã được retry có backoff/`Retry-After` ở tầng transport.
+- Test: `tests/unit/llmTransport.test.ts` mới (retry, body-read error, không retry 4xx, 429/5xx, `shouldContinue`, content rỗng, streaming DeepSeek với keep-alive/reasoning/dòng bị cắt/usage, lỗi giữa stream, stream bị treo → TIMEOUT, request shape Vilao/Gemini/DeepSeek, fallback non-stream, `withMinimalThinking`, thứ tự prompt, `upgradeLegacyDefaultPrompt`, migration 0009); `characterService.test.ts` thêm test chạy song song + cập nhật 1 assert (`jsonMode`). `vitest` 378/378 (chạy bằng Electron-as-Node vì app dev giữ khoá `better_sqlite3.node`), `tsc` 3 config + `eslint` sạch.
+
+**Điểm dừng:** không còn fail cả batch vì một lần đứt kết nối; bước chọn nhân vật rẻ/nhanh hơn rõ trên tab API Calls; không thay đổi schema. Dừng, chờ user xác nhận rồi mới tick `[x]`.
+
+
+**Xác nhận bởi user (2026-10-20):** đã xác nhận hoàn thành giai đoạn này.
+
+---
+
+## Phase 29 — Post-V1: Dọn cấu trúc source + sửa lỗi thao tác thủ công (2026-10-20)
+
+Yêu cầu trực tiếp của user: làm mục 1–9 trong bản review cấu trúc source (2026-10-20). **Không làm** các mục "nhỏ/tuỳ chọn" (sandbox, validate IPC ở main, rút gọn comment, bỏ `taskId` của `retryTask`, dời `legacyPrompts.ts`).
+
+**Không có schema change.** Không đổi IPC channel/`AppApi` nào mà Renderer đang dùng.
+
+### Việc cần làm
+
+**Sửa lỗi**
+
+1. **Retry/Generate thủ công chọn sai prompt Scene cho project "No Characters"** — `resolveChannelVilaoRuntime()` (`projects.ipc.ts`) luôn lấy `channel.sceneGenerationPrompt`, còn Run All (`resolvePipelineRuntime()`) chọn `sceneGenerationPromptNoCharacters` khi `project.hasCharacters=false`. Gộp 2 resolver về 1 chỗ (`src/main/pipeline/runtime.ts`), dùng chung hàm chọn prompt theo channel + `hasCharacters`.
+2. **Thao tác thủ công không dùng snapshot** (spec.md 32, CLAUDE.md) — Retry Character Prompt / Retry Scene / Generate thủ công đang đọc prompt + model *hiện hành* của channel. Sửa: project đã có snapshot (đã Run lần đầu) → dùng `*_prompt_snapshot` + `selected_model_snapshot` (provider/API key theo model snapshot); chưa có snapshot → dùng channel hiện hành như cũ. Run All giữ nguyên (validate + snapshot lần đầu bằng giá trị live, `PipelineService` tự chuyển sang snapshot).
+3. **Thao tác thủ công chạy chồng lên Run All** — `PipelineService` thêm `runExclusive(projectId, fn)`: thao tác thủ công đăng ký vào cùng map "đang chạy" với `runProject()`, nên Retry khi project đang chạy (hoặc Run All khi đang Retry) bị từ chối với thông báo rõ ràng. Xoá project giữa lúc Retry cũng chờ Retry xong như với Run All. UI: nút Retry ở Characters / Image Prompts disabled khi project đang `processing`.
+4. **`npm run build` không typecheck main/preload** — thêm script `typecheck` chạy cả 3 tsconfig, `build` gọi `typecheck`.
+
+**Cấu trúc**
+
+5. **Đổi tên `VilaoService` → `LlmClient`** (client OpenAI-compatible cho mọi provider từ Phase 25): `VilaoApiError` → `LlmApiError`, `VilaoServiceOptions` → `LlmClientOptions`, field/param `vilaoService` → `llmClient`. Gom file LLM vào `src/main/llm/` (`LlmClient.ts`, `pipelineLlmClient.ts`, `llmCallRecorder.ts`); `pipelineRuntime.ts` → `src/main/pipeline/runtime.ts`. Root `src/main/` chỉ còn `index.ts`, `container.ts`, `broadcast.ts`, `appSettingsStore.ts`. `VilaoConnectionStatus` (enum shared, Renderer dùng) giữ nguyên tên.
+6. **`ScenePromptService.generateBatch` 11 tham số vị trí** → gom phần không đổi trong 1 lần `generate()`/`retry()` vào object `BatchContext`, còn `generateBatch(ctx, start, length)`. Tách helper kiểm tra placeholder dùng chung cho `generate()`/`retry()`.
+7. **Composition root** — `src/main/container.ts` tạo mọi service đúng 1 lần (DB, Project/Channel/Srt/Character/ScenePrompt/Export/LlmCall/SecureStorage/Activation, `PipelineService`, `QueueService`, LLM call recorder); `registerXxxIpc(services)` nhận service qua tham số. Bỏ `getPipelineService()`/`getQueueService()` (singleton ẩn, `projects.ipc.ts` phải import ngược `queue.ipc.ts`). Helper `broadcast()` dùng chung (`src/main/broadcast.ts`) cho queue + recorder.
+8. **SQL thô trong `LlmCallService.getStats`** → chuyển sang `llmCalls.queries.ts` (`sumLlmCallTokens`).
+9. **`PipelineService` tìm task bằng `list…().find()`** → dùng `findPipelineTask()` đã có sẵn trong `pipelineTasks.queries.ts`.
+
+### Test
+
+- Unit mới: runtime resolver (chọn prompt No Characters, ưu tiên snapshot, provider theo model snapshot, lỗi thiếu key/model), `runExclusive` (từ chối khi đang Run All và ngược lại, `stopAndWait` chờ thao tác thủ công).
+- Regression: toàn bộ test cũ pass sau khi đổi tên/di chuyển file; `npm run typecheck` + `eslint` sạch.
+- Thủ công (user): project channel "No Characters" đã Run → Retry 1 scene lỗi, tab API Calls/kết quả dùng đúng prompt không nhân vật; sửa prompt channel sau khi Run rồi Retry → vẫn theo snapshot; bấm Run All, nút Retry bị khoá.
+
+**Ghi chú triển khai:**
+
+- **Mục 1–2:** `src/main/pipeline/runtime.ts` — `liveChannelSettings()` (chọn prompt theo `hasCharacters`) dùng chung cho `resolvePipelineRuntime()` (Run All/Queue, không throw) và `resolveManualLlmRuntime()` (thao tác thủ công, ưu tiên `snapshotSettings()` khi project đã có snapshot, throw message cho user khi thiếu model/key). `resolveChannelVilaoRuntime()` trong `projects.ipc.ts` đã bỏ.
+- **Mục 3:** `PipelineService.runExclusive()` dùng chung map `controllers` với `runProject()`; `projects.ipc.ts` bọc `characters.detect/generatePrompts/retryPrompt`, `scenePrompts.generate/retry` **và `srt.split`** (xoá + tạo lại blocks) qua `runManual()`. `runProject()` kiểm tra "đang chạy" trước khi đăng ký promise, để lần gọi bị từ chối không ghi đè promise của run đang chạy (trước đây `stopAndWait` có thể chờ nhầm promise). Nút Retry ở `CharactersPage`/`ImagePromptsPage` disabled (kèm tooltip) khi `status=processing` hoặc store đang chạy.
+- **Mục 4:** `npm run typecheck` (3 tsconfig), `build` gọi `typecheck`. Thư mục `tests/` vẫn chưa nằm trong tsconfig nào (vitest/esbuild không check type) — chưa thêm để không mở rộng phạm vi.
+- **Mục 5:** file mới: `src/main/llm/{LlmClient,pipelineLlmClient,llmCallRecorder}.ts`, `src/main/pipeline/runtime.ts`; test `vilaoService.test.ts` → `llmClient.test.ts`. `createPipelineLlmClient(apiKey, provider, onCall)` và `createLlmCallRecorder(service)` nhận dependency thay vì tự `getDatabase()`. Tên cũ trong spec.md (các mục lịch sử) giữ nguyên.
+- **Mục 6:** `BatchContext` + `buildBatchContext()` (gồm kiểm tra placeholder) dùng cho `generate()`/`retry()`; `generateBatch(ctx, start, length)`, `selectRelevantCharactersBatch(ctx, items)`.
+- **Mục 7:** `src/main/container.ts` `createMainServices()` + `enrichQueueItems()`; `src/main/broadcast.ts` (bỏ qua window đã destroy). `registerSettingsIpc()` không cần service nên giữ không tham số.
+- **Mục 8–9:** `sumLlmCallTokens()` trong `llmCalls.queries.ts`; `PipelineService` dùng `findPipelineTask()`.
+- Test: `tests/unit/pipelineRuntime.test.ts` mới (7 test), `pipelineService.test.ts` thêm 3 test `runExclusive`. `vitest` 388/388 (Electron-as-Node), `typecheck` + `eslint` sạch, `electron-vite build` OK.
+
+**Điểm dừng:** hành vi app không đổi ngoài 3 lỗi trên; không schema change. Dừng, chờ user xác nhận rồi mới tick `[x]`.
+
+
+**Xác nhận bởi user (2026-10-20):** đã xác nhận hoàn thành giai đoạn này.
 
 ---
 

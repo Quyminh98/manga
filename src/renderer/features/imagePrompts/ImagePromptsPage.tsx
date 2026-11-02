@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, Clapperboard, Copy, CopyCheck, Image, RotateCw, Search } from 'lucide-react'
+import { Copy, CopyCheck, Image, RotateCw, Search } from 'lucide-react'
 import { Button } from '@renderer/components/ui/Button'
 import { EmptyState } from '@renderer/components/ui/EmptyState'
 import { ErrorNotice } from '@renderer/components/ui/ErrorNotice'
 import { appApi } from '@renderer/lib/appApi'
 import { formatErrorForDisplay } from '@renderer/lib/errorDisplay'
+import { usePipelineStore } from '@renderer/stores/usePipelineStore'
 import { useProjectStore } from '@renderer/stores/useProjectStore'
-import { getMissingPlaceholders } from '@shared/prompts'
+import { ProjectStatus } from '@shared/enums'
+import { formatImagePromptsFile } from '@shared/exportFormat'
 import type { ScenePrompt, SrtBlock } from '@shared/entities'
-import type { ScenePromptGenerationProgress } from '@shared/ipc-types'
 
 // spec.md 8.5/24 — "PROMPT 001", zero-padded to 3 digits, same convention as
 // src/main/pipeline/generateScenePrompt.ts's formatBlockNumber (duplicated
@@ -21,23 +22,26 @@ function formatBlockNumber(blockIndex: number): string {
 // SRT text / relevant characters / generated prompt / status / retry / copy,
 // plus Search, Copy, Copy All. No Stitch screen exists for this page
 // (plan.md Phase 8 — "chưa có trong Stitch") — built with Tailwind against
-// DESIGN.md tokens, same convention as CharactersPage (Phase 6). "Generate
-// Image Prompts" is a temporary manual trigger standing in for Run All
-// (Phase 9), same pattern as "Split SRT" / "Detect Characters".
+// DESIGN.md tokens, same convention as CharactersPage (Phase 6). Generation
+// is driven by Run All (Phase 9/14, same pattern as SrtPage/CharactersPage —
+// the standalone "Generate Image Prompts" trigger was removed); this page
+// displays results live as batches land and lets the user retry an
+// individual failed Scene Prompt.
 export function ImagePromptsPage(): JSX.Element {
   const currentProject = useProjectStore((state) => state.currentProject)
   const projectId = currentProject?.id
+  // Main rejects a manual Retry while the project is running (Phase 29) —
+  // disable it here too so the user doesn't hit that error.
+  const isPipelineRunning = usePipelineStore((state) => state.isRunning)
+  const isProcessing = isPipelineRunning || currentProject?.status === ProjectStatus.PROCESSING
 
   const [blocks, setBlocks] = useState<SrtBlock[] | null>(null)
   const [scenePrompts, setScenePrompts] = useState<ScenePrompt[] | null>(null)
   const [search, setSearch] = useState('')
-  const [isGenerating, setIsGenerating] = useState(false)
   const [retryingBlockIndex, setRetryingBlockIndex] = useState<number | null>(null)
   const [copiedBlockIndex, setCopiedBlockIndex] = useState<number | null>(null)
   const [copiedAll, setCopiedAll] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [missingPlaceholders, setMissingPlaceholders] = useState<string[]>([])
-  const [progress, setProgress] = useState<ScenePromptGenerationProgress | null>(null)
 
   const refresh = useCallback(async (id: string) => {
     const [blockList, scenePromptList] = await Promise.all([appApi.srt.list(id), appApi.scenePrompts.list(id)])
@@ -50,23 +54,14 @@ export function ImagePromptsPage(): JSX.Element {
     setScenePrompts(null)
     setSearch('')
     setError(null)
-    setProgress(null)
     if (projectId) void refresh(projectId)
   }, [projectId, refresh])
 
-  useEffect(() => {
-    void (async () => {
-      const settings = await appApi.settings.get()
-      setMissingPlaceholders(getMissingPlaceholders('sceneGeneration', settings.promptSettings.sceneGeneration))
-    })()
-  }, [])
-
-  // Live "batch X / Y" progress while Generate Image Prompts is running —
-  // each batch's results are merged into the list as soon as it lands,
-  // instead of the whole list appearing only once generate() resolves.
+  // Live updates while Run All (TopBar/Processing, or a Queue-triggered run)
+  // is generating Scene Prompts — each batch's results are merged into the
+  // list as soon as it lands, regardless of what triggered the run.
   useEffect(() => {
     return appApi.scenePrompts.onProgress((p) => {
-      setProgress(p)
       setScenePrompts((prev) => {
         const byBlockIndex = new Map((prev ?? []).map((sp) => [sp.blockIndex, sp]))
         for (const sp of p.batchResults) byBlockIndex.set(sp.blockIndex, sp)
@@ -74,22 +69,6 @@ export function ImagePromptsPage(): JSX.Element {
       })
     })
   }, [])
-
-  const onGenerate = async (): Promise<void> => {
-    if (!projectId) return
-    setError(null)
-    setProgress(null)
-    setIsGenerating(true)
-    try {
-      const result = await appApi.scenePrompts.generate(projectId)
-      setScenePrompts(result)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Scene Prompt Generation failed.')
-    } finally {
-      setIsGenerating(false)
-      setProgress(null)
-    }
-  }
 
   const onRetry = async (blockIndex: number): Promise<void> => {
     if (!projectId) return
@@ -133,12 +112,9 @@ export function ImagePromptsPage(): JSX.Element {
 
   const onCopyAll = async (): Promise<void> => {
     if (!blocks) return
-    // spec.md 24 — same "PROMPT 00N:\n\n<prompt>" format used by image_prompts.txt export.
-    const text = blocks
-      .map((block) => scenePromptByBlockIndex.get(block.blockIndex))
-      .filter((sp): sp is ScenePrompt => !!sp && sp.status === 'success' && !!sp.prompt)
-      .map((sp) => `PROMPT ${formatBlockNumber(sp.blockIndex)}:\n\n${sp.prompt}`)
-      .join('\n\n\n')
+    // spec.md 24 — same shared formatter image_prompts.txt export uses, so
+    // Copy All can never drift from what actually gets written to disk.
+    const text = formatImagePromptsFile(scenePrompts ?? [])
     await navigator.clipboard.writeText(text)
     setCopiedAll(true)
     setTimeout(() => setCopiedAll(false), 1500)
@@ -148,61 +124,17 @@ export function ImagePromptsPage(): JSX.Element {
     return <div />
   }
 
-  const generateBlockedReason = !blocks || blocks.length === 0
-    ? 'Split the transcript into SRT blocks first'
-    : missingPlaceholders.length > 0
-      ? `Fix the Scene / Image Generation prompt in Settings > Prompts (missing ${missingPlaceholders.join(', ')})`
-      : undefined
-
   const successCount = (scenePrompts ?? []).filter((sp) => sp.status === 'success').length
 
   return (
     <div>
-      <div className="flex items-start justify-between gap-4 mb-6">
-        <div>
-          <h2 className="font-headline-lg text-headline-lg text-text-primary mb-2">Image Prompts</h2>
-          <p className="font-body-md text-body-md text-text-secondary">
-            One generated image prompt per SRT block, mapped 1:1.
-          </p>
-        </div>
-        <Button
-          variant="primary"
-          type="button"
-          onClick={() => void onGenerate()}
-          disabled={isGenerating || !!generateBlockedReason}
-          title={generateBlockedReason}
-        >
-          <Clapperboard size={14} />
-          {isGenerating ? 'Generating…' : 'Generate Image Prompts'}
-        </Button>
+      <div className="mb-6">
+        <h2 className="font-headline-lg text-headline-lg text-text-primary mb-2">Image Prompts</h2>
+        <p className="font-body-md text-body-md text-text-secondary">
+          One generated image prompt per SRT block, mapped 1:1.
+        </p>
       </div>
 
-      {isGenerating && progress && (
-        <div className="mb-4">
-          <div className="flex items-center justify-between mb-1.5">
-            <span className="font-body-sm text-body-sm text-text-secondary">
-              Batch {progress.batchesCompleted} / {progress.totalBatches}
-            </span>
-            <span className="font-code-sm text-code-sm text-text-secondary">
-              {progress.completedBlocks} / {progress.totalBlocks} prompts completed
-            </span>
-          </div>
-          {/* DESIGN.md Components > Progress Indicators: thin 2px bar, emerald-success. */}
-          <div className="h-0.5 w-full bg-surface-dim rounded-full overflow-hidden">
-            <div
-              className="h-full bg-emerald-success transition-all duration-300"
-              style={{ width: `${Math.round((progress.completedBlocks / progress.totalBlocks) * 100)}%` }}
-            />
-          </div>
-        </div>
-      )}
-
-      {generateBlockedReason && missingPlaceholders.length > 0 && (
-        <p className="mb-2 flex items-center gap-1.5 font-body-sm text-body-sm text-error">
-          <AlertTriangle size={14} />
-          {generateBlockedReason}
-        </p>
-      )}
       {error && <p className="mb-4 font-body-sm text-body-sm text-error">{formatErrorForDisplay(error)}</p>}
 
       {blocks === null ? (
@@ -211,7 +143,7 @@ export function ImagePromptsPage(): JSX.Element {
         <EmptyState
           icon={Image}
           title="No image prompts yet"
-          description="Split the transcript into SRT blocks, then click Generate Image Prompts."
+          description="Use Run All in the top bar to generate image prompts for every SRT block."
         />
       ) : (
         <>
@@ -289,7 +221,7 @@ export function ImagePromptsPage(): JSX.Element {
                     <p className="font-label-caps text-label-caps text-text-secondary uppercase mb-1">Generated Prompt</p>
                     {!scenePrompt ? (
                       <p className="font-body-sm text-body-sm text-text-secondary italic">
-                        Not generated yet — click &quot;Generate Image Prompts&quot;.
+                        Not generated yet — run the pipeline from the top bar.
                       </p>
                     ) : scenePrompt.status === 'failed' ? (
                       <div className="flex items-start justify-between gap-3 bg-surface-dim border border-error/40 rounded p-3">
@@ -302,7 +234,8 @@ export function ImagePromptsPage(): JSX.Element {
                           variant="ghost"
                           type="button"
                           onClick={() => void onRetry(block.blockIndex)}
-                          disabled={isRetrying}
+                          disabled={isRetrying || isProcessing}
+                          title={isProcessing ? 'Available once the current run finishes or is paused.' : undefined}
                         >
                           <RotateCw size={12} className={isRetrying ? 'animate-spin' : undefined} />
                           {isRetrying ? 'Retrying…' : 'Retry'}

@@ -35,38 +35,66 @@ export function formatSrtFile(blocks: SrtBlock[]): string {
   return entries.length > 0 ? `${entries.join('\n\n')}\n` : ''
 }
 
-// spec.md 23 — "CHARACTER 00N — @CharacterId" header + blank line + prompt,
-// double blank line between entries. Only characters with a successful
-// (non-empty) prompt are included — a character whose prompt hasn't been
-// generated/failed has nothing to export. Numbering follows `characters`
-// list order (created_at ASC — detection order), not character_prompts order.
+// spec.md 23 — "@CharacterId: <prompt>" all on one line/paragraph, single
+// blank line between entries. Only characters with a successful (non-empty)
+// prompt are included — a character whose prompt hasn't been
+// generated/failed has nothing to export. List order follows `characters`
+// list order (created_at ASC — detection order), not character_prompts
+// order. normalizePromptText() guards against any pre-existing multi-line
+// prompt content in the DB (character prompts were never guaranteed
+// single-line before this format changed) the same way
+// generateScenePrompt.ts's own normalizePromptText() already does for scene
+// prompts.
 export function formatCharacterPromptsFile(characters: Character[], prompts: CharacterPrompt[]): string {
   const promptByCharacterId = new Map(prompts.map((p) => [p.characterId, p]))
   const entries: string[] = []
   characters.forEach((character) => {
     const prompt = promptByCharacterId.get(character.characterId)?.prompt
     if (!prompt) return
-    entries.push(`CHARACTER ${pad3(entries.length + 1)} — ${character.characterId}\n\n${prompt}`)
+    entries.push(`${character.characterId}: ${normalizePromptText(prompt)}`)
   })
-  return entries.length > 0 ? `${entries.join('\n\n\n')}\n` : ''
+  return entries.length > 0 ? `${entries.join('\n\n')}\n` : ''
 }
 
-// spec.md 24 — "PROMPT 00N:" header + blank line + prompt, double blank line
-// between entries, numbered by `blockIndex` so PROMPT 00N always maps 1:1 to
-// SRT 00N (a block whose scene prompt failed/is pending is simply skipped,
-// not renumbered — the *next* successful block keeps its own blockIndex).
+// Collapses any line breaks to a single space (same rule generateScenePrompt.ts's
+// normalizePromptText() enforces at generation time) so exported prompt text is
+// always one line/paragraph, regardless of how it was stored.
+function normalizePromptText(text: string): string {
+  return text.replace(/\r?\n+/g, ' ').replace(/ {2,}/g, ' ').trim()
+}
+
+// spec.md 24 — "PROMPT 00N: " header inline with the prompt (same
+// line/paragraph), single blank line between entries, numbered by
+// `blockIndex` so PROMPT 00N always maps 1:1 to SRT 00N (a block whose scene
+// prompt failed/is pending is simply skipped, not renumbered — the *next*
+// successful block keeps its own blockIndex).
 export function formatImagePromptsFile(scenePrompts: ScenePrompt[]): string {
   const entries = scenePrompts
     .filter((sp) => !!sp.prompt)
     .sort((a, b) => a.blockIndex - b.blockIndex)
-    .map((sp) => `PROMPT ${pad3(sp.blockIndex)}:\n\n${sp.prompt}`)
-  return entries.length > 0 ? `${entries.join('\n\n\n')}\n` : ''
+    .map((sp) => `PROMPT ${pad3(sp.blockIndex)}: ${sp.prompt}`)
+  return entries.length > 0 ? `${entries.join('\n\n')}\n` : ''
 }
 
-// spec.md 21 — output folder "Project_Name/" — strip characters that are
-// invalid in a macOS/Windows path component; keep spaces/unicode as-is since
-// the project's actual display name is the intended folder/file base name.
-export function sanitizeProjectFolderName(name: string): string {
+// spec.md 21 (Phase 24 addendum) — one Character ID per line, "@" prefix
+// stripped, no blank lines between entries. Lists every detected character
+// (Character Database order, created_at ASC) regardless of whether its
+// Character Prompt succeeded — unlike formatCharacterPromptsFile, this is a
+// plain name index, not a usable-output file, so an unprompted character
+// still belongs on it. ExportService only writes this file at all when the
+// project has at least one character (see its own comment) — this function
+// itself just returns '' for an empty list, same convention as the others.
+export function formatCharacterListFile(characters: Character[]): string {
+  const entries = characters.map((character) => character.characterId.replace(/^@/, ''))
+  return entries.length > 0 ? `${entries.join('\n')}\n` : ''
+}
+
+// spec.md 21 — output folder "Channel_Name/Project_Name/" (Phase 20, channel
+// subfolder added) — strip characters that are invalid in a macOS/Windows
+// path component; keep spaces/unicode as-is since the actual display name is
+// the intended folder/file base name. Shared by both the channel and project
+// path segments, and by the .srt file's base name.
+export function sanitizeFolderName(name: string, fallback: string): string {
   const cleaned = name.trim().replace(/[/\\:*?"<>|]+/g, '_')
-  return cleaned.length > 0 ? cleaned : 'Untitled_Project'
+  return cleaned.length > 0 ? cleaned : fallback
 }

@@ -1,10 +1,14 @@
 import { app, BrowserWindow, shell } from 'electron'
 import { join } from 'path'
+import { createMainServices } from './container'
+import { registerActivationIpc } from './ipc/activation.ipc'
 import { registerProjectsIpc } from './ipc/projects.ipc'
 import { registerPipelineIpc } from './ipc/pipeline.ipc'
+import { registerQueueIpc } from './ipc/queue.ipc'
 import { registerSettingsIpc } from './ipc/settings.ipc'
-import { registerVilaoIpc } from './ipc/vilao.ipc'
+import { registerProvidersIpc } from './ipc/providers.ipc'
 import { registerExportIpc } from './ipc/export.ipc'
+import { registerChannelsIpc } from './ipc/channels.ipc'
 
 function createMainWindow(): void {
   const mainWindow = new BrowserWindow({
@@ -41,11 +45,15 @@ function createMainWindow(): void {
 }
 
 function registerIpcHandlers(): void {
-  registerProjectsIpc()
-  registerPipelineIpc()
+  const services = createMainServices()
+  registerActivationIpc(services)
+  registerChannelsIpc(services)
+  registerProjectsIpc(services)
+  registerPipelineIpc(services)
+  registerQueueIpc(services)
   registerSettingsIpc()
-  registerVilaoIpc()
-  registerExportIpc()
+  registerProvidersIpc(services)
+  registerExportIpc(services)
 }
 
 app.whenReady().then(() => {

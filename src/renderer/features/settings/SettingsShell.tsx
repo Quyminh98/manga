@@ -5,10 +5,10 @@ import { Button } from '@renderer/components/ui/Button'
 // Settings is reached via the HomeSidebar "Settings" tab (or the project
 // TopBar's gear icon) — nested under `/` in router.tsx so HomeSidebar stays
 // visible instead of Settings taking over the full window. 4 tabs: General /
-// Vilao API / Prompts / Advanced.
+// API Keys / Prompts / Advanced.
 const TABS = [
   { to: 'general', label: 'General' },
-  { to: 'vilao-api', label: 'Vilao API' },
+  { to: 'api-keys', label: 'API Keys' },
   { to: 'prompts', label: 'Prompts' },
   { to: 'advanced', label: 'Advanced' }
 ]
@@ -32,7 +32,7 @@ export function SettingsShell(): JSX.Element {
             <h1 className="font-headline-lg text-headline-lg text-text-primary">Settings</h1>
           </div>
           <p className="font-body-md text-body-md text-text-secondary ml-9">
-            Configure your workspace, Vilao API connection and default prompts.
+            Configure your workspace, API keys (Vilao, DeepSeek, Gemini) and default prompts.
           </p>
         </div>
         <Button variant="primary" disabled>

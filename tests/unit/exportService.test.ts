@@ -1,11 +1,12 @@
 import { randomUUID } from 'crypto'
-import { mkdtempSync, readFileSync, rmSync } from 'fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import type Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createDatabase } from '../../src/main/db/client'
 import { ProjectService } from '../../src/main/services/ProjectService'
+import { ChannelService } from '../../src/main/services/ChannelService'
 import { ExportService } from '../../src/main/services/ExportService'
 import { insertSrtBlocks } from '../../src/main/db/queries/srtBlocks.queries'
 import { insertCharacters } from '../../src/main/db/queries/characters.queries'
@@ -94,23 +95,32 @@ describe('ExportService', () => {
 
     const { folderPath } = exportService.export(project.id, tmpDir)
 
-    expect(folderPath).toBe(join(tmpDir, 'My Test Project'))
+    // Every project falls back to the migration-seeded "Default" channel
+    // when created without an explicit channelId (see ProjectService.create).
+    expect(folderPath).toBe(join(tmpDir, 'Default', 'My Test Project'))
     expect(readFileSync(join(folderPath, 'My Test Project.srt'), 'utf-8')).toBe(
       '1\n00:00:00,000 --> 00:00:03,000\nHello world.\n'
     )
     expect(readFileSync(join(folderPath, 'character_prompts.txt'), 'utf-8')).toBe(
-      'CHARACTER 001 — @Hero\n\nCharacter design of @Hero, brave protagonist.\n'
+      '@Hero: Character design of @Hero, brave protagonist.\n'
     )
     expect(readFileSync(join(folderPath, 'image_prompts.txt'), 'utf-8')).toBe(
-      'PROMPT 001:\n\nComic page layout, hero says hello.\n'
+      'PROMPT 001: Comic page layout, hero says hello.\n'
     )
+    expect(readFileSync(join(folderPath, 'character_list.txt'), 'utf-8')).toBe('Hero\n')
   })
 
   it('sanitizes a project name with path-invalid characters for the folder/file name', () => {
     const project = projectService.create({ name: 'Weird: Name / Test?', transcript: 'Hi.' })
     const { folderPath } = exportService.export(project.id, tmpDir)
-    expect(folderPath).toBe(join(tmpDir, 'Weird_ Name _ Test_'))
+    expect(folderPath).toBe(join(tmpDir, 'Default', 'Weird_ Name _ Test_'))
     expect(() => readFileSync(join(folderPath, 'Weird_ Name _ Test_.srt'), 'utf-8')).not.toThrow()
+  })
+
+  it('does not write character_list.txt for a project with no characters', () => {
+    const project = projectService.create({ name: 'No Characters Project', transcript: 'Hi.' })
+    const { folderPath } = exportService.export(project.id, tmpDir)
+    expect(existsSync(join(folderPath, 'character_list.txt'))).toBe(false)
   })
 
   it('throws for an unknown project id', () => {
@@ -123,5 +133,35 @@ describe('ExportService', () => {
     expect(readFileSync(join(folderPath, 'Empty Project.srt'), 'utf-8')).toBe('')
     expect(readFileSync(join(folderPath, 'character_prompts.txt'), 'utf-8')).toBe('')
     expect(readFileSync(join(folderPath, 'image_prompts.txt'), 'utf-8')).toBe('')
+  })
+
+  // Phase 20 (user request) — nests output under a channel-name folder so
+  // projects from different channels never collide in the same base folder.
+  it('nests the output folder under the project\'s channel name', () => {
+    const channelService = new ChannelService(db)
+    const channel = channelService.create({
+      name: 'Historical Manhua',
+      avgCharacters: 300,
+      variancePercent: 30,
+      fakeDurationSec: 3,
+      selectedModel: null,
+      characterDetectionPrompt: 'd {{TRANSCRIPT}}',
+      characterGenerationPrompt: 'g {{CHARACTERS}}',
+      sceneGenerationPrompt: 's {{BLOCK_NUMBER}} {{SRT_TEXT}} {{RELEVANT_CHARACTERS}} {{RELEVANT_CHARACTER_PROMPTS}}',
+      sceneGenerationPromptNoCharacters: 'no-characters s {{BLOCK_NUMBER}} {{SRT_TEXT}}',
+      sceneConcurrency: 4,
+      sceneBatchSize: 10,
+      hasCharacters: true
+    })
+    const project = projectService.create({ name: 'In a channel', transcript: '', channelId: channel.id })
+
+    const { folderPath } = exportService.export(project.id, tmpDir)
+
+    expect(folderPath).toBe(join(tmpDir, 'Historical Manhua', 'In a channel'))
+  })
+
+  it('resolveFolderPath() matches export()\'s path without touching disk', () => {
+    const project = projectService.create({ name: 'Preview only', transcript: '' })
+    expect(exportService.resolveFolderPath(project.id, tmpDir)).toBe(join(tmpDir, 'Default', 'Preview only'))
   })
 })

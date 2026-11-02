@@ -1,0 +1,1 @@
+npm run generate-activation-code -- --machine-id <id-vừa-nhận>

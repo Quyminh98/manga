@@ -1,5 +1,5 @@
 import type { Character, SrtBlock } from '@shared/entities'
-import type { LlmChatMessage } from '../services/VilaoService'
+import type { LlmChatMessage } from '../llm/LlmClient'
 import { repairJsonText } from './jsonRepair'
 import { LlmResponseFormatError } from './errors'
 
@@ -10,7 +10,7 @@ import { LlmResponseFormatError } from './errors'
 // Database, spec.md 17), a character-length token estimate, priority-ordered
 // trimming when that estimate is over budget (spec.md 18.4), prompt
 // templating, and multi-prompt response parsing. Orchestration
-// (local/LLM relevant-character selection per SRT, calling VilaoService with
+// (local/LLM relevant-character selection per SRT, calling LlmClient with
 // retries, persisting to `scene_prompts`) lives in ScenePromptService.
 
 const BLOCK_NUMBER_PLACEHOLDER = '{{BLOCK_NUMBER}}'
@@ -19,12 +19,18 @@ const RELEVANT_CHARACTERS_PLACEHOLDER = '{{RELEVANT_CHARACTERS}}'
 const RELEVANT_CHARACTER_PROMPTS_PLACEHOLDER = '{{RELEVANT_CHARACTER_PROMPTS}}'
 
 // spec.md 17 — "gộp nhiều SRT liên tiếp vào 1 request thay vì gọi riêng từng
-// SRT" (added after V1 ran too slowly at 1 SRT/request). Not a DB/settings
-// field — a fixed pipeline constant, same convention as
-// CHARACTER_PROMPT_BATCH_SIZE. Lowered from 20 to 10 (2026-08-09, user
-// request — a 20-block batch felt slow) to shorten how long each request
-// takes and, as a side effect, shrink the largest possible per-batch retry
-// cost if SceneFormatCollapseError's batch-shrinking fallback ever kicks in.
+// SRT" (added after V1 ran too slowly at 1 SRT/request). Lowered from 20 to
+// 10 (2026-08-09, user request — a 20-block batch felt slow) to shorten how
+// long each request takes and, as a side effect, shrink the largest possible
+// per-batch retry cost if SceneFormatCollapseError's batch-shrinking fallback
+// ever kicks in.
+//
+// 2026-08-10 (user request) — this stopped being the real fixed value: it's
+// now only chunkSrtBlocks()'s fallback default (used by callers/tests that
+// don't pass an explicit batchSize). The actual app always passes
+// `project.sceneBatchSize` (per-project, Settings > Advanced > Pipeline
+// Tuning, range 1-30, ProjectService.DEFAULT_SCENE_BATCH_SIZE) —
+// see ScenePromptService.generate().
 export const SCENE_PROMPT_BATCH_SIZE = 10
 
 export function chunkSrtBlocks(blocks: SrtBlock[], batchSize = SCENE_PROMPT_BATCH_SIZE): SrtBlock[][] {
@@ -260,6 +266,14 @@ export function buildSceneGenerationMessages(
 // than a plain Error) still drives the same batch-shrinking recovery.
 export class SceneFormatCollapseError extends LlmResponseFormatError {}
 
+// spec.md 30 rule 10 — a single prompt must never contain a line break, but
+// that rule is advisory (prompt text), not enforced by the model — collapse
+// any newline the model still emits into a single space regardless, so the
+// stored prompt is guaranteed one line even when the model doesn't comply.
+function normalizePromptText(text: string): string {
+  return text.replace(/\r?\n+/g, ' ').replace(/ {2,}/g, ' ').trim()
+}
+
 // spec.md 30's OUTPUT contract: { "scene_prompts": [{ "block_number": 1,
 // "prompt": "..." }] } — one object per requested block. snake_case,
 // matching the vocabulary parseCharacterGenerationResponse's
@@ -317,7 +331,7 @@ export function parseSceneGenerationResponse(content: string, blockIndexes: numb
       throw new SceneFormatCollapseError(`Scene Generation response contains a duplicate block_number ${formatBlockNumber(blockNumber)}`)
     }
 
-    const prompt = typeof record.prompt === 'string' ? record.prompt.trim() : ''
+    const prompt = typeof record.prompt === 'string' ? normalizePromptText(record.prompt) : ''
     if (!prompt) throw new SceneFormatCollapseError(`Scene ${formatBlockNumber(blockNumber)} is missing "prompt"`)
     byBlockIndex.set(blockNumber, prompt)
   })

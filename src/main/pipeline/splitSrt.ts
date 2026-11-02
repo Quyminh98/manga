@@ -10,17 +10,15 @@ export interface SplitSrtBlock {
 }
 
 const SENTENCE_DELIMITERS = /[^.?!…]+[.?!…]+|[^.?!…]+$/g
-// Priority order for splitting a single sentence that's already longer than
-// maxCharacters (spec.md 11.3): ; then : then , then nearest whitespace.
-const OVERSIZED_SPLIT_CHARS = [';', ':', ',']
 
-// `maxCharacters` must mean "user-visible characters" consistently across
-// scripts (Vietnamese diacritics, Japanese/Korean, emoji), not raw JS
-// UTF-16 code units — `.length`/`.slice()` would over-count decomposed
-// Vietnamese diacritics (NFD) and can slice through a surrogate pair or a
-// combining mark, corrupting a character at the cut point. Intl.Segmenter's
-// grapheme granularity gives the actual rendered-character boundaries, so
-// every length check / slice below goes through grapheme arrays instead.
+// `avgCharacters`/bounds below must mean "user-visible characters"
+// consistently across scripts (Vietnamese diacritics, Japanese/Korean,
+// emoji), not raw JS UTF-16 code units — `.length`/`.slice()` would
+// over-count decomposed Vietnamese diacritics (NFD) and can slice through a
+// surrogate pair or a combining mark, corrupting a character at the cut
+// point. Intl.Segmenter's grapheme granularity gives the actual
+// rendered-character boundaries, so every length check / slice below goes
+// through grapheme arrays instead.
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
 
 function toGraphemes(text: string): string[] {
@@ -50,49 +48,30 @@ function segmentSentences(transcript: string): string[] {
   return sentences
 }
 
-// spec.md 11.3: a single sentence longer than maxCharacters gets broken into
-// chunks, each ≤ maxCharacters, preferring ; then : then , then whitespace
-// nearest the limit — hard-cutting mid-word only when nothing else fits.
-// Operates on grapheme-cluster arrays throughout so a hard-cut lands between
-// characters, never inside one (e.g. a Vietnamese base letter + diacritic,
-// or a surrogate-pair kanji/emoji).
-function splitOversizedSentence(sentence: string, maxCharacters: number): string[] {
-  const chunks: string[] = []
-  let remaining = toGraphemes(sentence.trim())
-
-  while (remaining.length > maxCharacters) {
-    const window = remaining.slice(0, maxCharacters)
-    let cutIndex = -1
-
-    for (const breakChar of OVERSIZED_SPLIT_CHARS) {
-      const idx = window.lastIndexOf(breakChar)
-      if (idx > 0) {
-        cutIndex = idx + 1 // keep the punctuation with the chunk it closes
-        break
-      }
-    }
-
-    if (cutIndex === -1) {
-      const idx = window.lastIndexOf(' ')
-      if (idx > 0) cutIndex = idx
-    }
-
-    if (cutIndex === -1) cutIndex = maxCharacters // hard-cut, last resort
-
-    const chunk = remaining.slice(0, cutIndex).join('').trim()
-    if (chunk) chunks.push(chunk)
-    remaining = toGraphemes(remaining.slice(cutIndex).join('').trim())
-  }
-
-  const tail = remaining.join('').trim()
-  if (tail) chunks.push(tail)
-  return chunks
-}
-
-// spec.md 11.2: greedily gather units (sentences, or oversized-sentence
-// chunks) until the next one would push the block past maxCharacters
-// (measured in graphemes, matching splitOversizedSentence/maxCharacters).
-function gatherBlocks(units: string[], maxCharacters: number): string[] {
+// spec.md 11.2: greedily gather sentences into a block. Normally stops as
+// soon as the next sentence would push the block past `max` — but if the
+// block hasn't reached `min` yet, the next sentence is added anyway even if
+// that overshoots `max`, rather than flushing a too-short block (user
+// request, Phase 18: "average ± variance%" instead of a hard ceiling — a
+// block only overshoots when the alternative is ending up well under the
+// target average). `min < max` guards the override — at `min === max`
+// (variancePercent = 0) there's no real range to "reach", so this degrades
+// to the old hard-ceiling behavior exactly. Without that guard, `currentLength
+// < min` would be true on almost every step (since `min` then equals the
+// single point `avgCharacters`, which a growing block only ever equals
+// exactly by coincidence), forcing every unit to merge into one giant block
+// regardless of `max` — a real bug caught by tests/unit/srtSplitter.test.ts's
+// variance-0 cases.
+//
+// A single sentence longer than `max` on its own (2026-08-11, user request —
+// mandatory rule: never cut before a sentence actually ends) is never split
+// mid-sentence — it becomes its own oversized block instead. That's what the
+// `!current` branch guarantees below: a brand-new block always accepts its
+// first sentence regardless of length, and the very next sentence then can't
+// fit either (candidateLength > max, currentLength already >= max >= min so
+// the "reach min" override can't fire), so it gets flushed as a standalone
+// block before starting the next one.
+function gatherBlocks(units: string[], min: number, max: number): string[] {
   const blocks: string[] = []
   let current = ''
   let currentLength = 0
@@ -100,11 +79,11 @@ function gatherBlocks(units: string[], maxCharacters: number): string[] {
   for (const unit of units) {
     const unitLength = graphemeLength(unit)
     const candidateLength = current ? currentLength + 1 + unitLength : unitLength // +1 = joining space
-    if (candidateLength <= maxCharacters) {
+    if (!current || candidateLength <= max || (currentLength < min && min < max)) {
       current = current ? `${current} ${unit}` : unit
       currentLength = candidateLength
     } else {
-      if (current) blocks.push(current)
+      blocks.push(current)
       current = unit
       currentLength = unitLength
     }
@@ -116,17 +95,18 @@ function gatherBlocks(units: string[], maxCharacters: number): string[] {
 
 export function splitTranscriptToSrtBlocks(
   transcript: string,
-  maxCharacters: number,
+  avgCharacters: number,
+  variancePercent: number,
   fakeDurationSec: number
 ): SplitSrtBlock[] {
+  const min = Math.max(1, Math.round(avgCharacters * (1 - variancePercent / 100)))
+  const max = Math.round(avgCharacters * (1 + variancePercent / 100))
+
   // NFC first: text pasted from macOS/PDF sources is often NFD (diacritics
   // as separate combining marks), which would otherwise inflate Vietnamese
   // character counts before grapheme segmentation even runs.
   const sentences = segmentSentences(transcript.normalize('NFC'))
-  const units = sentences.flatMap((sentence) =>
-    graphemeLength(sentence) <= maxCharacters ? [sentence] : splitOversizedSentence(sentence, maxCharacters)
-  )
-  const blocks = gatherBlocks(units, maxCharacters)
+  const blocks = gatherBlocks(sentences, min, max)
   const durationMs = fakeDurationSec * 1000
 
   return blocks.map((text, i) => {

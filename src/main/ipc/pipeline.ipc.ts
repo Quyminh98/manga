@@ -1,35 +1,23 @@
 import { ipcMain } from 'electron'
 import { IpcChannels } from '@shared/ipc-channels'
 import type { PipelineTask } from '@shared/entities'
-import { getAppSettings } from '../appSettingsStore'
-import { getDatabase } from '../services/DatabaseService'
-import { PipelineService, type PipelineRuntime } from '../services/PipelineService'
-import { SecureStorageService } from '../services/SecureStorageService'
-import { VilaoService } from '../services/VilaoService'
+import type { MainServices } from '../container'
+import { resolvePipelineRuntime } from '../pipeline/runtime'
 
 // spec.md 36/37/19 — Run All orchestration + Pause/Resume/Cancel/Retry Failed,
 // on top of PipelineService (which wraps the services built in Phase 5-8).
-export function registerPipelineIpc(): void {
-  const pipelineService = new PipelineService(getDatabase())
-  const secureStorage = new SecureStorageService()
-
-  // Doesn't throw on a missing key/model — unlike the equivalent resolver in
-  // projects.ipc.ts, pipeline.run wants validateProjectForRun to produce the
-  // friendly spec.md 38 message instead of a generic IPC rejection.
-  function resolveRuntime(): PipelineRuntime {
-    const apiKey = secureStorage.getApiKey()
-    const settings = getAppSettings()
-    return {
-      vilaoService: apiKey ? new VilaoService({ apiKey }) : null,
-      model: settings.selectedModel,
-      promptSettings: settings.promptSettings,
-      hasApiKey: !!apiKey
-    }
-  }
+// It's the same shared instance queue.ipc.ts uses, so a project queued but
+// not yet started and one run manually here agree on what's "already running".
+export function registerPipelineIpc(services: MainServices): void {
+  const { pipelineService } = services
 
   async function run(event: Electron.IpcMainInvokeEvent, projectId: string): Promise<void> {
-    await pipelineService.runProject(projectId, resolveRuntime(), (task) =>
-      event.sender.send(IpcChannels.pipeline.progressEvent, task)
+    await pipelineService.runProject(
+      projectId,
+      resolvePipelineRuntime(services, projectId),
+      (task) => event.sender.send(IpcChannels.pipeline.progressEvent, task),
+      // Live Scene Generation progress for the Processing/Overview tabs.
+      (progress) => event.sender.send(IpcChannels.scenePrompts.progressEvent, progress)
     )
   }
 

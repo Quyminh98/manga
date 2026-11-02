@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_CHARACTER_DETECTION_PROMPT,
   DEFAULT_CHARACTER_GENERATION_PROMPT,
+  DEFAULT_SCENE_GENERATION_NO_CHARACTERS_PROMPT,
   DEFAULT_SCENE_GENERATION_PROMPT,
   getMissingPlaceholders
 } from '../../src/shared/prompts'
@@ -28,5 +29,17 @@ describe('getMissingPlaceholders', () => {
     expect(getMissingPlaceholders('characterDetection', DEFAULT_CHARACTER_DETECTION_PROMPT)).toEqual([])
     expect(getMissingPlaceholders('characterGeneration', DEFAULT_CHARACTER_GENERATION_PROMPT)).toEqual([])
     expect(getMissingPlaceholders('sceneGeneration', DEFAULT_SCENE_GENERATION_PROMPT)).toEqual([])
+    expect(getMissingPlaceholders('sceneGenerationNoCharacters', DEFAULT_SCENE_GENERATION_NO_CHARACTERS_PROMPT)).toEqual([])
+  })
+
+  // Phase 22 — sceneGenerationNoCharacters never needs the character
+  // placeholders (there's never any character data for a hasCharacters=false
+  // project), only BLOCK_NUMBER/SRT_TEXT.
+  it('sceneGenerationNoCharacters only requires BLOCK_NUMBER/SRT_TEXT, not the character placeholders', () => {
+    expect(getMissingPlaceholders('sceneGenerationNoCharacters', 'Just some text with no placeholders.')).toEqual([
+      '{{BLOCK_NUMBER}}',
+      '{{SRT_TEXT}}'
+    ])
+    expect(getMissingPlaceholders('sceneGenerationNoCharacters', '{{BLOCK_NUMBER}} {{SRT_TEXT}}')).toEqual([])
   })
 })

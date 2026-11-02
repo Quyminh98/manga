@@ -1,11 +1,11 @@
 import type { Character } from '@shared/entities'
-import type { LlmChatMessage } from '../services/VilaoService'
+import type { LlmChatMessage } from '../llm/LlmClient'
 import { repairJsonText } from './jsonRepair'
 import { LlmResponseFormatError } from './errors'
 
 // spec.md 15 — Step 3: Character Prompt Generation. Pure functions only
 // (batching, prompt templating, JSON parsing/validation), no Electron/DB/
-// network — orchestration (calling VilaoService with retries, persisting to
+// network — orchestration (calling LlmClient with retries, persisting to
 // `character_prompts`) lives in CharacterService, same split as
 // pipeline/detectCharacters.ts.
 
