@@ -5,7 +5,6 @@ export function StatusBar(): JSX.Element {
       <div className="font-code-sm text-code-sm text-text-secondary">StoryPrompt Desktop v0.1.0</div>
       <div className="flex items-center gap-6 font-code-sm text-code-sm text-text-secondary">
         <span>No project running</span>
-        <span>Vilao: Not configured</span>
       </div>
     </footer>
   )

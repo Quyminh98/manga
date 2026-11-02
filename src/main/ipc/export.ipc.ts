@@ -1,43 +1,20 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
+import { ipcMain, shell } from 'electron'
 import { IpcChannels } from '@shared/ipc-channels'
-import { ErrorCode } from '@shared/enums'
-import { formatStoredError } from '@shared/errorCode'
-import { getAppSettings, saveAppSettings } from '../appSettingsStore'
-import { getDatabase } from '../services/DatabaseService'
-import { ExportService } from '../services/ExportService'
+import { getAppSettings } from '../appSettingsStore'
+import type { MainServices } from '../container'
 
-// spec.md 21/8.7 — Export tab's "Export Project" button. Main owns the
-// native folder picker (same 3-layer rule as projects.loadTranscriptFile),
-// writes the 3-file bundle via ExportService, and remembers the chosen
-// parent folder as AppSettings.lastExportFolder for the next export.
-export function registerExportIpc(): void {
-  const exportService = new ExportService(getDatabase())
+// spec.md 21/8.7 — the 3-file bundle is now written automatically by
+// PipelineService when Run All completes (straight into
+// AppSettings.lastExportFolder, "Default Export Folder" from Settings >
+// General), not from a manual button here. This file just supports the
+// Export tab's "Show in Finder": getFolderPath() tells the Renderer where
+// that folder is (or would be) without touching disk, showInFinder() reveals it.
+export function registerExportIpc({ exportService }: MainServices): void {
 
-  ipcMain.handle(IpcChannels.export.project, async (event, projectId: string): Promise<{ folderPath: string }> => {
+  ipcMain.handle(IpcChannels.export.getFolderPath, async (_event, projectId: string): Promise<string | null> => {
     const settings = getAppSettings()
-    const options: Electron.OpenDialogOptions = {
-      title: 'Choose export destination',
-      properties: ['openDirectory', 'createDirectory'],
-      defaultPath: settings.lastExportFolder ?? app.getPath('documents')
-    }
-    const window = BrowserWindow.fromWebContents(event.sender)
-    const result = await (window ? dialog.showOpenDialog(window, options) : dialog.showOpenDialog(options))
-    if (result.canceled || result.filePaths.length === 0) {
-      throw new Error('EXPORT_CANCELED')
-    }
-
-    const targetParentDir = result.filePaths[0]
-    let folderPath: string
-    try {
-      folderPath = exportService.export(projectId, targetParentDir).folderPath
-    } catch (err) {
-      // spec.md 34 — EXPORT_ERROR, the one error code not already produced
-      // by classifyError (ExportService never touches VilaoService).
-      const message = err instanceof Error ? err.message : 'Export failed.'
-      throw new Error(formatStoredError(ErrorCode.EXPORT_ERROR, message))
-    }
-    saveAppSettings({ lastExportFolder: targetParentDir })
-    return { folderPath }
+    if (!settings.lastExportFolder) return null
+    return exportService.resolveFolderPath(projectId, settings.lastExportFolder)
   })
 
   ipcMain.handle(IpcChannels.export.showInFinder, async (_event, folderPath: string): Promise<void> => {

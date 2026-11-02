@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto'
 import type Database from 'better-sqlite3'
 import type { Character, CharacterPrompt, Project } from '@shared/entities'
-import { ErrorCode, TaskStatus } from '@shared/enums'
+import { ErrorCode, TaskStatus, TaskType } from '@shared/enums'
 import { formatStoredError } from '@shared/errorCode'
 import { getMissingPlaceholders } from '@shared/prompts'
 import { findProjectById } from '../db/queries/projects.queries'
@@ -17,6 +17,7 @@ import {
   upsertCharacterPrompt
 } from '../db/queries/characterPrompts.queries'
 import { rateLimitDelayMs, sleep } from '../pipeline/backoff'
+import { runWithConcurrency } from '../pipeline/concurrency'
 import { classifyError } from '../pipeline/errorClassification'
 import {
   buildCharacterDetectionMessages,
@@ -30,10 +31,10 @@ import {
   chunkCharacters,
   parseCharacterGenerationResponse
 } from '../pipeline/generateCharacterPrompts'
-import type { VilaoService } from './VilaoService'
+import type { LlmClient } from '../llm/LlmClient'
 
 export interface DetectCharactersParams {
-  vilaoService: VilaoService
+  llmClient: LlmClient
   promptTemplate: string
   // `projects.selected_model` isn't written anywhere yet — the app only has
   // one global model selection (Settings > Vilao API / AppSettings.selectedModel)
@@ -44,13 +45,13 @@ export interface DetectCharactersParams {
 }
 
 export interface GenerateCharacterPromptsParams {
-  vilaoService: VilaoService
+  llmClient: LlmClient
   promptTemplate: string
   model: string
 }
 
 // No electron import — same convention as ProjectService/SrtService, unit
-// testable via createDatabase(':memory:') and a fake VilaoService (only
+// testable via createDatabase(':memory:') and a fake LlmClient (only
 // .chat() needs to be implemented).
 export class CharacterService {
   constructor(private readonly db: Database.Database) {}
@@ -86,7 +87,7 @@ export class CharacterService {
     let rateLimitStreak = 0
     for (let attempt = 1; attempt <= project.maxRetry; attempt++) {
       try {
-        const detected = await this.detectOnce(params, project.transcript)
+        const detected = await this.detectOnce(projectId, params, project.transcript)
         const characters = this.toCharacters(projectId, detected)
         this.persistCharacters(projectId, characters)
         return characters
@@ -120,9 +121,14 @@ export class CharacterService {
     throw new Error(formatStoredError(code, `Character Detection failed after ${project.maxRetry} attempt(s): ${message}`))
   }
 
-  private async detectOnce(params: DetectCharactersParams, transcript: string): Promise<DetectedCharacter[]> {
+  private async detectOnce(projectId: string, params: DetectCharactersParams, transcript: string): Promise<DetectedCharacter[]> {
     const messages = buildCharacterDetectionMessages(params.promptTemplate, transcript)
-    const response = await params.vilaoService.chat({ model: params.model, messages })
+    const response = await params.llmClient.chat({
+      model: params.model,
+      messages,
+      meta: { projectId, step: TaskType.DETECT_CHARACTERS },
+      jsonMode: true
+    })
     return parseCharacterDetectionResponse(response.content)
   }
 
@@ -175,7 +181,7 @@ export class CharacterService {
       let succeeded = false
       for (let attempt = 1; attempt <= project.maxRetry; attempt++) {
         try {
-          perChunkResults.push(await this.detectOnce(params, chunk))
+          perChunkResults.push(await this.detectOnce(projectId, params, chunk))
           succeeded = true
           break
         } catch (err) {
@@ -222,9 +228,12 @@ export class CharacterService {
     // out a prompt that already succeeded on an earlier run.
     const existingPrompts = new Map(this.listPrompts(projectId).map((p) => [p.characterId, p.prompt]))
 
-    for (const batch of chunkCharacters(characters)) {
-      await this.runGenerationBatch(projectId, batch, params, project.maxRetry, existingPrompts)
-    }
+    // Phase 28 — batches are independent (each writes only its own characters),
+    // so they run in parallel, as many at once as Scene Generation
+    // (project.sceneConcurrency) rather than one after another.
+    await runWithConcurrency(chunkCharacters(characters), project.sceneConcurrency, (batch) =>
+      this.runGenerationBatch(projectId, batch, params, project.maxRetry, existingPrompts)
+    )
 
     return this.listPrompts(projectId)
   }
@@ -266,7 +275,12 @@ export class CharacterService {
     for (let attempt = 1; attempt <= maxRetry; attempt++) {
       try {
         const messages = buildCharacterGenerationMessages(params.promptTemplate, batch)
-        const response = await params.vilaoService.chat({ model: params.model, messages })
+        const response = await params.llmClient.chat({
+          model: params.model,
+          messages,
+          meta: { projectId, step: TaskType.GENERATE_CHARACTER_PROMPTS },
+          jsonMode: true
+        })
         const results = parseCharacterGenerationResponse(
           response.content,
           batch.map((c) => c.characterId)

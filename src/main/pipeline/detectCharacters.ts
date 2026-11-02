@@ -1,10 +1,10 @@
-import type { LlmChatMessage } from '../services/VilaoService'
+import type { LlmChatMessage } from '../llm/LlmClient'
 import { repairJsonText } from './jsonRepair'
 import { LlmResponseFormatError } from './errors'
 
 // spec.md 14 — Step 2: Character Detection. Pure functions only (prompt
 // templating + JSON parsing/validation), no Electron/DB/network — orchestration
-// (calling VilaoService with retries, persisting to `characters`) lives in
+// (calling LlmClient with retries, persisting to `characters`) lives in
 // CharacterService so this stays unit-testable in isolation.
 
 // Shape of one item in the LLM's `characters` JSON array (spec.md 28 OUTPUT).

@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { FolderKanban, Plus, Settings as SettingsIcon } from 'lucide-react'
+import { FolderKanban, ListOrdered, Plus, Radio, Settings as SettingsIcon } from 'lucide-react'
 import { useUiStore } from '@renderer/stores/useUiStore'
 
 // Sidebar for the Home shell (project-less context) — 3 tabs: the project
@@ -11,6 +11,8 @@ import { useUiStore } from '@renderer/stores/useUiStore'
 const NAV_ITEMS = [
   { to: '/', label: 'Projects', icon: FolderKanban, end: true },
   { to: '/new', label: 'New Project', icon: Plus, end: false },
+  { to: '/queue', label: 'Queue', icon: ListOrdered, end: false },
+  { to: '/channels', label: 'Channels', icon: Radio, end: false },
   { to: '/settings', label: 'Settings', icon: SettingsIcon, end: false }
 ]
 
@@ -32,7 +34,6 @@ export function HomeSidebar(): JSX.Element {
       >
         <div className="px-gutter mb-8">
           <h1 className="font-headline-md text-headline-md text-text-primary">StoryPrompt</h1>
-          <p className="font-label-caps text-label-caps text-text-secondary mt-1">AI STRATEGIST</p>
         </div>
 
         <div className="px-4 mb-2">

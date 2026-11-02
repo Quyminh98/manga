@@ -28,6 +28,8 @@
 9. Cho phép export ra các file SRT/TXT.
 10. Lưu trạng thái project để có thể Resume nếu app bị đóng, API lỗi hoặc pipeline bị dừng.
 
+**Cập nhật (Phase 15, ngoài phạm vi V1 gốc):** mục 10 chỉ còn đúng ở tầng **cơ chế lưu trạng thái** (mọi kết quả đã hoàn thành vẫn được giữ nguyên, không mất) — phần "để có thể Resume" **không còn đúng qua UI nữa** cho trạng thái `paused` cụ thể: nút Resume bị xoá hẳn khỏi TopBar/Processing tab/Home theo yêu cầu trực tiếp của user, không còn cách nào từ giao diện để chạy tiếp 1 project đang `paused` (kể cả trường hợp app bị force-quit giữa chừng rồi mở lại — mục 37). Xem mục 6.2/7/8.6/19.3/37/39 để biết chi tiết từng nơi bị ảnh hưởng.
+
 Mục tiêu UI là đơn giản: người dùng nhập transcript, chọn model, nhấn **Run All**, app tự xử lý toàn bộ.
 
 ---
@@ -92,6 +94,8 @@ Mục tiêu UI là đơn giản: người dùng nhập transcript, chọn model,
 - **UI layer:** Tailwind CSS (token màu/typography/spacing lấy từ `.stitch/DESIGN.md`, khai báo trong `tailwind.config.ts`), `lucide-react` cho icon, `react-hook-form` + `@hookform/resolvers/zod` + `zod` cho mọi form (validate trước khi ghi DB) — theo CLAUDE.md UI Rules.
 - **Testing:** `vitest` cho unit test (services/pure function ở Main process, ví dụ `tests/unit/projectService.test.ts`) — cấu hình alias `@shared`/`@renderer` riêng trong `vitest.config.ts` vì Vite/electron-vite alias không tự áp dụng cho test runner.
 
+**Setup Windows lần đầu — implementation thật (Phase 14, ghi lại vì ảnh hưởng việc chạy code, không phải requirement sản phẩm):** 3 vấn đề build native module (`better-sqlite3`) chỉ gặp trên Windows, không gặp trên macOS. (1) Python 3.14 thiếu module `distutils` mà `node-gyp` cần — fix: cài thêm `setuptools`. (2) Node trên Windows build native module bằng `clang-cl` mặc định, nhưng máy chỉ cài toolset MSVC — fix: file `.npmrc` (đã checked-in ở root repo) chứa `clang=0` để ép dùng MSVC. (3) `ELECTRON_RUN_AS_NODE=1` do VS Code tự set sẵn cho terminal tích hợp, khiến `npm run dev`/electron.launch() chạy Electron như Node thuần (window không mở, hoặc Playwright driver báo "Process failed to launch!") — phải `unset ELECTRON_RUN_AS_NODE` trước khi chạy.
+
 **Kích thước cửa sổ — implementation thật (Phase 13):** `BrowserWindow` (`src/main/index.ts`) mở mặc định `1440×900`, `minWidth: 768`/`minHeight: 640`. `minWidth` ban đầu là `1024` — đúng bằng breakpoint `lg` (1024px, mặc định Tailwind) mà `.stitch/DESIGN.md`'s "Layout & Spacing > Responsive Behavior" dùng làm điểm Sidebar collapse thành drawer — nghĩa là cửa sổ không bao giờ resize được xuống dưới ngưỡng đó, vô hiệu hoá tính năng responsive trên thực tế. Hạ xuống `768` để có khoảng resize 768–1024px thật sự đi qua breakpoint này.
 
 ## 3.2. State Management
@@ -139,7 +143,8 @@ Có thể dùng:
 - electron-store
 
 Lưu:
-- maxCharacters
+- avgCharacters (đổi tên từ maxCharacters, Phase 19)
+- variancePercent (thêm ở Phase 19)
 - fakeSrtDurationSec
 - selected model
 - prompt settings
@@ -179,6 +184,8 @@ V1:
 V2:
 - build installer Windows.
 
+**Cập nhật (Phase 15, ngoài phạm vi V1 gốc) — bắt đầu đóng gói Windows thật, sớm hơn kế hoạch V2:** `electron-builder.yml` thêm `win.target: nsis`. Quan trọng hơn: **`asar: false`** (tắt hẳn asar, không dùng mặc định `asar: true` + `asarUnpack`) — phát hiện qua build thật + `require()` trực tiếp trên binary đã đóng gói: `better-sqlite3` (native module) tự phụ thuộc package JS thuần `bindings` để tìm file `.node`; heuristic mặc định của electron-builder chỉ tự unpack đúng package có file `.node` (`better-sqlite3`), để `bindings` kẹt lại nén trong `app.asar` — `require('bindings')` từ vị trí đã unpack không "nhảy ngược" vào asar được, app mở lên rồi tắt ngay lập tức lúc chạm SQLite lần đầu (không có crash log, vì đây không phải native crash mà là exception JS khi `require()` thất bại). Tắt hẳn asar tránh cả lớp bug này (mọi file là đường dẫn thật, `require()` hành xử giống hệt lúc dev) thay vì phải tự liệt kê từng transitive dependency cần `asarUnpack`. Thêm script `npm run dist` (`build` + `electron-builder --win`) làm lối tắt duy nhất để đóng gói. **Chưa build/cài thử bản NSIS installer thật trên máy khác** — mới verify được cấu trúc package (`out/`, `node_modules`, native module load thành công) qua build `dir` target, chưa click-through UI thật (môi trường agent lúc debug bị chặn mở GUI thật, không phải hạn chế của app).
+
 ---
 
 # 4. Kiến trúc ứng dụng
@@ -201,17 +208,19 @@ Electron Main Process
     ├── CharacterService
     ├── ScenePromptService
     ├── PipelineService
+    ├── QueueService
     ├── ExportService
     ├── SecureStorageService
     └── DatabaseService
 ```
 
-Danh sách service thật (`src/main/services/`) khác sơ đồ gốc ở 4 điểm:
+Danh sách service thật (`src/main/services/`) khác sơ đồ gốc ở 5 điểm:
 
 - **`CharacterService`** (thêm ở Phase 6) không nằm trong danh sách service gốc ban đầu — đóng vai trò sub-resource service cho `characters`/`character_prompts` giống cách `SrtService` đảm nhiệm `srt_blocks`, cùng convention "không import `electron`, unit-test qua `createDatabase(':memory:')`".
 - **`ScenePromptService`** (thêm ở Phase 8, cùng convention trên) — sub-resource service cho `scene_prompts`, đảm nhiệm cả Relevant Character Selection (mục 16) lẫn Scene Prompt Generation (mục 17), gồm batching + concurrency nội bộ (mục 33).
-- **`PromptService`/`TaskQueueService` không tồn tại như class riêng** (quyết định ở Phase 9, xem thêm mục 33/36): prompt chỉ là dữ liệu (`AppSettings.promptSettings` qua `electron-store` + hằng số mặc định `src/shared/prompts.ts`, mục 26/27) không có business logic đủ phức tạp để cần 1 service riêng; concurrency Character Detection/Generation (=1) đã là hành vi tự nhiên của `CharacterService` gọi tuần tự, còn concurrency Scene Generation (mặc định 4, mục 33) implement thẳng trong `ScenePromptService.generate()` (`runWithConcurrency()` nội bộ) — `PipelineService` chỉ điều phối thứ tự gọi các service này theo đúng mục 36, không cần lớp `TaskQueueService` bọc ngoài chỉ để có tên gọi khớp sơ đồ. `PipelineService` (`src/main/services/PipelineService.ts`, mới ở Phase 9) tái dùng 4 service trên thay vì tự viết lại retry/batch/persist.
+- **`PromptService`/`TaskQueueService` (bản gốc, "queue trong 1 pipeline") không tồn tại như class riêng** (quyết định ở Phase 9, xem thêm mục 33/36): prompt chỉ là dữ liệu (`AppSettings.promptSettings` qua `electron-store` + hằng số mặc định `src/shared/prompts.ts`, mục 26/27) không có business logic đủ phức tạp để cần 1 service riêng; concurrency Character Detection/Generation (=1) đã là hành vi tự nhiên của `CharacterService` gọi tuần tự, còn concurrency Scene Generation (mặc định 4, mục 33) implement thẳng trong `ScenePromptService.generate()` (`runWithConcurrency()` nội bộ) — `PipelineService` chỉ điều phối thứ tự gọi các service này theo đúng mục 36, không cần lớp `TaskQueueService` bọc ngoài chỉ để có tên gọi khớp sơ đồ. `PipelineService` (`src/main/services/PipelineService.ts`, mới ở Phase 9) tái dùng 4 service trên thay vì tự viết lại retry/batch/persist. **Không nhầm với `QueueService` bên dưới** — 2 khái niệm "queue" khác nhau, phục vụ 2 nhu cầu khác nhau.
 - **`ExportService`** (`src/main/services/ExportService.ts`, thêm ở Phase 11) — đọc `srt_blocks`/`characters`/`character_prompts`/`scene_prompts` qua các query đã có sẵn, ghi 3 file export ra đĩa (mục 21-24); logic format thuần (không đụng Electron/DB) tách riêng ở `src/shared/exportFormat.ts` để Export tab dùng lại y hệt cho phần preview (mục 8.7), tránh 2 nguồn sự thật giữa preview và file ghi thật.
+- **`QueueService`** (`src/main/services/QueueService.ts`, thêm ở Phase 14, ngoài phạm vi V1 gốc — xem mục 6.4) — **khác hẳn** ý tưởng `TaskQueueService` bị bác ở trên: đây là hàng đợi chạy **nhiều project** tuần tự (project B tự chạy khi project A xong), không phải hàng đợi task/LLM-call bên trong 1 project. Cùng convention "không import Electron", nhận `runProject` như 1 callback (dependency injection) thay vì giữ tham chiếu `PipelineService` trực tiếp, để unit-test độc lập không cần DB/Electron thật. Chỉ tồn tại in-memory, không có bảng riêng trong schema.md (mất khi tắt app — quyết định có chủ đích, xem mục 6.4).
 
 ## 4.1. Renderer Process
 
@@ -233,15 +242,16 @@ Expose các IPC API tối thiểu bằng `contextBridge`.
 Interface đầy đủ (nguồn chuẩn: `src/shared/ipc-types.ts` → `AppApi`), nhóm theo domain — `srt`/`characters`/`scenePrompts` là sub-resource của project nên IPC handler tương ứng gộp chung trong `src/main/ipc/projects.ipc.ts` (không tách file riêng như tên domain gợi ý):
 
 ```ts
-window.appApi.projects.create(input)
+window.appApi.projects.create(input) // input.channelId bắt buộc từ Phase 17 (mục 6.5) — chọn 1 lần, cố định vĩnh viễn
 window.appApi.projects.open(id)
+window.appApi.projects.get(id) // Phase 15, không có trong danh sách gốc — đọc thuần, KHÔNG có side effect (khác open(), vốn bump last_opened_at và tự downgrade processing→paused nếu isActuallyRunning=false, xem mục 37). usePipelineStore's live status refresh dùng get() thay open() để không tự làm sai status của 1 run đang thật sự chạy.
 window.appApi.projects.list()
 window.appApi.projects.rename(id, name)
 window.appApi.projects.delete(id)
 window.appApi.projects.showInFinder(id)
 window.appApi.projects.updateTranscript(id, transcript)
 window.appApi.projects.loadTranscriptFile() // dialog.showOpenDialog ở Main, trả nội dung file hoặc null nếu cancel
-window.appApi.projects.updatePipelineSettings(id, { maxRetry, sceneConcurrency }) // Phase 9, không có trong danh sách gốc — Settings > Advanced ghi trực tiếp vào project đang mở (2 field per-project, không phải AppSettings)
+window.appApi.projects.updatePipelineSettings(id, { maxRetry, sceneConcurrency, sceneBatchSize }) // Phase 9, không có trong danh sách gốc — Settings > Advanced ghi trực tiếp vào project đang mở (3 field per-project, không phải AppSettings; sceneBatchSize thêm ở Phase 17, xem mục 17/33 — UI chỉ còn sửa được sceneConcurrency/sceneBatchSize, maxRetry hết chỉnh được từ Phase 16, xem mục 10.3)
 
 window.appApi.srt.list(projectId)
 window.appApi.srt.split(projectId)
@@ -274,8 +284,19 @@ window.appApi.vilao.listModels()
 window.appApi.vilao.hasApiKey() // Phase 6 (fix UX Settings > Vilao API), check file tồn tại cục bộ — không giải mã, không gọi mạng
 window.appApi.vilao.clearApiKey() // Phase 6, xoá hẳn credential đã lưu (SecureStorageService.clear(), có sẵn từ Phase 3 nhưng chưa expose IPC)
 
-window.appApi.export.project(projectId)
-window.appApi.export.showInFinder(folderPath) // Phase 11, không có trong danh sách gốc — reveals đúng folder export.project() vừa ghi (projects.showInFinder luôn trỏ vào file SQLite, không phải folder export riêng)
+window.appApi.export.getFolderPath(projectId) // Phase 14, thay window.appApi.export.project() cũ (đã xoá hẳn) — trả về nơi file đã/sẽ được ghi, không tự ghi gì cả (mục 21)
+window.appApi.export.showInFinder(folderPath) // Phase 11, không có trong danh sách gốc — reveals đúng folder export ghi ra (projects.showInFinder luôn trỏ vào file SQLite, không phải folder export riêng)
+
+window.appApi.queue.add(projectId) // Phase 14, mới hoàn toàn, ngoài phạm vi V1 gốc — xem mục 6.4
+window.appApi.queue.remove(projectId) // chỉ xoá được item đang `queued`, không xoá được item đang `running`
+window.appApi.queue.list()
+window.appApi.queue.onUpdate(callback) // trả về unsubscribe function, bắn lại toàn bộ danh sách mỗi khi add/remove/start/finish
+
+window.appApi.channels.list() // Phase 17, mới hoàn toàn, ngoài phạm vi V1 gốc — xem mục 6.5. Trả về Channel[] kèm projectCount mỗi channel
+window.appApi.channels.get(id)
+window.appApi.channels.create(input) // input = { name, avgCharacters, variancePercent, fakeDurationSec, selectedModel, characterDetectionPrompt, characterGenerationPrompt, sceneGenerationPrompt, sceneConcurrency, sceneBatchSize } — avgCharacters/variancePercent đổi tên/thêm ở Phase 19
+window.appApi.channels.update(id, input) // cùng shape input, sửa mọi field kể cả tên
+window.appApi.channels.delete(id) // reject nếu channel còn project, hoặc là channel cuối cùng còn lại
 ```
 
 Bật trong `webPreferences` của `BrowserWindow`:
@@ -289,9 +310,15 @@ Không bật Node integration trực tiếp trong Renderer.
 
 Từ Phase 2, `projects.*` (create/open/list/rename/delete/showInFinder) và `settings.get/save` đã nối logic thật (`ProjectService` + SQLite thật qua `DatabaseService`, `AppSettings` qua `electron-store`). Từ Phase 3, `vilao.*` (saveApiKey/testConnection/listModels) cũng đã nối logic thật (`SecureStorageService` + `VilaoService`, xem mục 5.2). Từ Phase 4, `projects.updateTranscript`/`projects.loadTranscriptFile` cũng đã nối logic thật (autosave transcript debounce + Load `.txt` qua `dialog.showOpenDialog`, xem mục 6.3/8.2) — 2 method này không nằm trong danh sách gốc ban đầu, được thêm khi implement vì kiến trúc 3 lớp (Renderer không đụng filesystem) đòi hỏi Main phải là nơi mở dialog/đọc file. Từ Phase 5, `srt.list`/`srt.split` cũng đã nối logic thật (`SrtService`, xem mục 11.5/13). Từ Phase 6, `characters.list`/`characters.detect` đã nối logic thật (`CharacterService` + `VilaoService.chat()`, xem mục 14) và `vilao.hasApiKey`/`vilao.clearApiKey` được thêm mới (không nằm trong danh sách gốc, fix UX ô API key ở Settings > Vilao API — xem mục 5.1). Từ Phase 7, `characters.listPrompts` cũng đã nối logic thật, và `characters.generatePrompts`/`characters.retryPrompt` được thêm mới (không nằm trong danh sách gốc, cùng lý do "cần 1 trigger thủ công thay Run All" như `characters.detect` — xem mục 15). Từ Phase 8, `scenePrompts.list`/`scenePrompts.generate`/`scenePrompts.retry` cũng đã nối logic thật (`ScenePromptService`, xem mục 16.4/17), và `scenePrompts.onProgress` được thêm mới (không nằm trong danh sách gốc — phát sinh khi implement, để Image Prompts tab hiện tiến trình "Batch X/Y" trong lúc `generate()` đang chạy thay vì chỉ có label "Generating…" tĩnh, xem mục 8.5).
 
-**Từ Phase 9, `pipeline.*` đã nối logic thật** (`PipelineService`, xem mục 36): `pipeline.run`/`pipeline.resume`/`pipeline.retryTask` cả 3 trỏ vào cùng 1 hàm `runProject()` ở Main (mỗi bước bên trong tự gated nên Run/Resume/Retry Failed là cùng 1 lời gọi, không có code path riêng theo từng cái tên — xem mục 19.3/36). `pipeline.pause`/`pipeline.cancel` cũng cùng 1 hàm bên dưới (không có trạng thái "cancelled" riêng, xem mục 37). `pipeline.listTasks` chỉ trả về 3 task cấp dự án (`SPLIT_SRT`/`DETECT_CHARACTERS`/`GENERATE_CHARACTER_PROMPTS`) — breakdown "Scene 001/002/..." đọc thẳng từ `scenePrompts.list()` đã có sẵn từ Phase 8 (xem mục 8.6/25). `projects.updatePipelineSettings` được thêm mới (không nằm trong danh sách gốc — Settings > Advanced > Pipeline Tuning cần 1 IPC ghi trực tiếp `projects.max_retry`/`scene_concurrency` của project đang mở).
+**Từ Phase 9, `pipeline.*` đã nối logic thật** (`PipelineService`, xem mục 36): `pipeline.run`/`pipeline.resume`/`pipeline.retryTask` cả 3 trỏ vào cùng 1 hàm `runProject()` ở Main (mỗi bước bên trong tự gated nên Run/Resume/Retry Failed là cùng 1 lời gọi, không có code path riêng theo từng cái tên — xem mục 19.3/36). `pipeline.pause`/`pipeline.cancel` cũng cùng 1 hàm bên dưới (không có trạng thái "cancelled" riêng, xem mục 37). `pipeline.listTasks` chỉ trả về 3 task cấp dự án (`SPLIT_SRT`/`DETECT_CHARACTERS`/`GENERATE_CHARACTER_PROMPTS`) — breakdown "Scene 001/002/..." đọc thẳng từ `scenePrompts.list()` đã có sẵn từ Phase 8 (xem mục 8.6/25). `projects.updatePipelineSettings` được thêm mới (không nằm trong danh sách gốc — Settings > Advanced > Pipeline Tuning cần 1 IPC ghi trực tiếp `projects.max_retry`/`scene_concurrency` của project đang mở; thêm field thứ 3 `scene_batch_size` ở Phase 17, xem mục 17).
 
-**Từ Phase 11, `export.*` đã nối logic thật** (`ExportService`, xem mục 21-24): `export.project(projectId)` mở `dialog.showOpenDialog` (chọn thư mục cha, nhớ lại `AppSettings.lastExportFolder` làm `defaultPath` lần sau), ghi 3 file, reject `Error('EXPORT_CANCELED')` nếu user huỷ dialog (Renderer coi đây là no-op im lặng, không phải lỗi — lưu ý: `ipcRenderer` bọc lỗi Main thành `Error invoking remote method '...': Error: EXPORT_CANCELED`, nên phía Renderer phải check `.includes()` chứ không phải so sánh `===`). `export.showInFinder(folderPath)` được thêm mới (không nằm trong danh sách gốc — `projects.showInFinder` có sẵn từ Phase 2 luôn trỏ vào file SQLite, không phải folder export riêng của project).
+**Từ Phase 11, `export.*` đã nối logic thật** (`ExportService`, xem mục 21-24). **Thay đổi lớn ở Phase 14 (xem mục 8.7/21):** `export.project(projectId)` (mở `dialog.showOpenDialog` mỗi lần bấm) **đã bị xoá hẳn**, không còn trong `AppApi` — thay bằng `export.getFolderPath(projectId)` (chỉ đọc, không ghi gì) vì việc ghi file giờ tự động xảy ra trong `PipelineService.runProject()` ngay khi Run All hoàn tất, không còn qua 1 lời gọi IPC do Renderer chủ động trigger nữa. `export.showInFinder(folderPath)` giữ nguyên (thêm từ Phase 11, không nằm trong danh sách gốc — `projects.showInFinder` có sẵn từ Phase 2 luôn trỏ vào file SQLite, không phải folder export riêng của project).
+
+**Từ Phase 14, `queue.*` là namespace hoàn toàn mới** (`QueueService`, xem mục 6.4) — không nằm trong bất kỳ danh sách gốc nào (tính năng phát sinh sau khi V1 hoàn thành ở Phase 13, theo yêu cầu trực tiếp trong lúc user tự test app). `queue.add`/`queue.remove`/`queue.list` đều là lời gọi đơn giản uỷ quyền thẳng cho `QueueService`; `queue.onUpdate` bắn lại toàn bộ danh sách (không phải diff) mỗi lần có thay đổi, cùng pattern với `pipeline.onProgress`/`scenePrompts.onProgress` đã có từ trước.
+
+**Cũng ở Phase 14:** `pipeline.pause`/`pipeline.cancel` **vẫn còn tồn tại nguyên vẹn trong `AppApi`/IPC** (không bị xoá) nhưng từ phase này **không còn nơi nào trong Renderer gọi tới** — 2 nút Pause/Cancel ở TopBar/Processing tab đã bị bỏ hẳn, thay bằng 1 nút **Delete** duy nhất khi đang chạy (xem mục 7/8.6/37). Tương tự, `srt.split`/`characters.detect`/`characters.generatePrompts` (dùng cho 3 nút tạm thời "Split SRT"/"Detect Characters"/"Generate Character Prompts" ở mục 8.3/8.4) cũng còn nguyên trong `AppApi`/IPC nhưng không còn nút nào gọi tới nữa sau khi 3 nút đó bị xoá ở Phase 14 — Run All (mục 36) giờ là đường duy nhất để chạy các bước này. Quyết định giữ nguyên IPC thay vì xoá luôn: không đụng tới phần Main Process đã test kỹ chỉ để dọn 1 vài dòng khai báo, trong khi việc xoá nút UI là yêu cầu rõ ràng của user.
+
+**Ở Phase 15:** `scenePrompts.generate` gia nhập nhóm "còn IPC, hết UI gọi" ở trên — nút **Generate Image Prompts** (`ImagePromptsPage.tsx`, nút tạm-thời-thay-Run-All cuối cùng còn sót lại từ Phase 8, bị bỏ sót khi Phase 14 dọn 3 nút kia) bị xoá nốt, cùng lý do "Run All đã đủ dùng" (mục 8.5). `pipeline.resume`/`pipeline.retryTask` cũng chưa từng có nút gọi trực tiếp (luôn qua `pipeline.run`, đúng cơ chế 1-hàm-3-tên ở mục 19.3/36) — không đổi gì thêm ở phase này, chỉ xác nhận lại. `projects.loadTranscriptFile` gia nhập nhóm này luôn — toolbar Transcript (Paste/Select All/Clear/Load .txt) bị xoá hẳn khỏi `TranscriptPage.tsx` theo yêu cầu user (mục 8.2); IPC vẫn còn nguyên, không có UI nào gọi Load .txt nữa (khác `Paste`/`Select All`/`Clear`, vốn không đi qua IPC — mất nút không mất chức năng vì làm tay được trực tiếp trong textarea).
 
 ## 4.3. Main Process
 
@@ -442,7 +469,11 @@ Nhập:
 Sau khi tạo:
 - project được lưu local ngay lập tức.
 
-`projects.max_characters`/`fake_duration_sec` của project mới được khởi tạo từ `AppSettings.maxCharacters`/`fakeSrtDurationSec` hiện hành (Settings > General, mục 10) tại thời điểm tạo — không phải hằng số cố định. `ProjectService.create(input, defaults?)` (Phase 4) nhận `defaults` này qua IPC handler `projects:create` (đọc `AppSettings` trước khi gọi service); nếu không truyền, fallback về default schema.md (300/3). Sau khi tạo, giá trị này thuộc riêng project — đổi Settings > General sau đó không ảnh hưởng project đã tạo (khác snapshot prompt ở mục 32 vốn chỉ set khi Run lần đầu, đây set ngay khi tạo project). `projects.max_retry`/`scene_concurrency` thì luôn khởi tạo bằng hằng số cố định (3/4 — `scene_concurrency` nâng từ 2 lên 4 ngày 2026-08-09, xem mục 33) bất kể `AppSettings` — không có field tương ứng trong `AppSettings` (xem mục 10.3, thêm sẽ là schema change); chỉnh 2 field này sau khi tạo qua Settings > Advanced > Pipeline Tuning (Phase 9, mục 33) ghi trực tiếp vào project đang mở, không qua `AppSettings`.
+`projects.max_characters`/`fake_duration_sec` của project mới được khởi tạo từ `AppSettings.maxCharacters`/`fakeSrtDurationSec` hiện hành (Settings > General, mục 10) tại thời điểm tạo — không phải hằng số cố định. `ProjectService.create(input, defaults?)` (Phase 4) nhận `defaults` này qua IPC handler `projects:create` (đọc `AppSettings` trước khi gọi service); nếu không truyền, fallback về default schema.md (300/3). Sau khi tạo, giá trị này thuộc riêng project — đổi Settings > General sau đó không ảnh hưởng project đã tạo (khác snapshot prompt ở mục 32 vốn chỉ set khi Run lần đầu, đây set ngay khi tạo project). `projects.max_retry`/`scene_concurrency` thì luôn khởi tạo bằng hằng số cố định (1/4 — `scene_concurrency` nâng từ 2 lên 4 ngày 2026-08-09, `max_retry` hạ từ 3 xuống 1 ngày 2026-08-10, xem mục 33) bất kể `AppSettings` — không có field tương ứng trong `AppSettings` (xem mục 10.3, thêm sẽ là schema change); `scene_concurrency` vẫn chỉnh được sau khi tạo qua Settings > Advanced > Pipeline Tuning (Phase 9, mục 33), `max_retry` thì không còn UI để chỉnh (mục 10.3, Phase 16).
+
+**Cập nhật (Phase 14, ngoài phạm vi V1 gốc):** nút submit của form New Project đổi tên từ "Create Project" thành **"Add to Queue"** — sau khi tạo project (`projects.create`) xong, gọi luôn `queue.add(project.id)` (mục 6.4) rồi điều hướng thẳng tới tab Processing của project đó thay vì Overview. Hành vi thật sự phụ thuộc trạng thái Run Queue lúc bấm: nếu queue đang rảnh, project mới **chạy Run All ngay lập tức**; nếu đang có project khác chạy, nó xếp hàng chờ tới lượt — cả 2 nhánh dùng chung đúng 1 lời gọi `queue.add()`, không có code path "kiểm tra có đang chạy không rồi tự quyết định" riêng ở Renderer.
+
+**Cập nhật (Phase 15, ngoài phạm vi V1 gốc):** điều hướng sau khi bấm "Add to Queue" đổi từ tab Processing của project mới sang thẳng màn **Queue** (`/queue`, mục 6.4) — theo yêu cầu trực tiếp của user, hợp lý hơn vì project vừa tạo có thể chưa tới lượt chạy ngay (đang queued phía sau project khác), nên xem nó trong danh sách Queue tự nhiên hơn là mở thẳng 1 trang Processing có thể chưa có gì để xem.
 
 ## 6.2. Project History
 
@@ -456,7 +487,6 @@ Created
 Last updated
 Status
 Progress
-Model
 ```
 
 Status:
@@ -476,13 +506,23 @@ Actions:
 ```text
 Open
 Resume
-Rename
 Delete
-Show in Finder
-Export
 ```
 
-**Implementation thật (Phase 9, Resume):** `ProjectsListPage.tsx` — nút Resume enable khi `status` là `paused`/`failed`/`completed_with_errors` (đứng yên/disable với `draft`/`ready`/`processing`/`completed`), điều hướng thẳng tới tab Processing của project đó (`/projects/:id/processing`) thay vì tự chạy pipeline ngay tại Home — người dùng bấm Resume/Retry Failed thật ở Processing tab hoặc TopBar (mục 8.6/37). **Cập nhật (Phase 11):** `Export` hết disabled — bấm mở dialog chọn thư mục (cùng `export.project()` Export tab dùng), ghi file xong tự mở Show in Finder; disabled trở lại khi project chưa có `srt_blocks` (mục 8.7/21).
+**Implementation thật (Phase 9, Resume):** `ProjectsListPage.tsx` — nút Resume enable khi `status` là `paused`/`failed`/`completed_with_errors` (đứng yên/disable với `draft`/`ready`/`processing`/`completed`), điều hướng thẳng tới tab Processing của project đó (`/projects/:id/processing`) thay vì tự chạy pipeline ngay tại Home — người dùng bấm Resume/Retry Failed thật ở Processing tab hoặc TopBar (mục 8.6/37).
+
+**Cập nhật lớn (Phase 14, ngoài phạm vi V1 gốc):** row Home rút gọn lại, không còn khớp danh sách "Actions"/field gốc phía trên nữa (đã sửa lại đúng thực tế):
+- **`Model` bị bỏ khỏi field hiển thị** — không còn lý do hiển thị vì Run All giờ là đường duy nhất để chạy, model chọn ở Settings chung, không còn cần so sánh model giữa các project ngay tại Home.
+- **`Rename` bị xoá khỏi Actions** — cùng với đó, `RenameProjectModal` (component cục bộ trong `ProjectsListPage.tsx`) và `renameProjectSchema`/`RenameProjectFormValues` (`project.schema.ts`) bị xoá theo vì không còn nơi nào dùng. **IPC `projects.rename` vẫn còn nguyên** (không bị xoá, chỉ không còn UI nào gọi tới).
+- **`Show in Finder` và `Export` bị xoá khỏi Actions** — dư thừa sau khi export chuyển sang tự động (mục 8.7/21): không còn hành động "export thủ công từng project ở Home" nữa vì Run All đã tự ghi file khi xong.
+- Action **`Add to Queue`** (thêm ở Phase 14, xem mục 6.4) từng có mặt ở đây một thời gian ngắn trong lúc phát triển nhưng **bị xoá lại** theo yêu cầu — điểm duy nhất để thêm project vào Run Queue hiện tại là nút "Add to Queue" trên màn New Project (mục 6.1) lúc tạo project mới, không có ở Home.
+- Row còn lại đúng 3 action: **Open / Resume / Delete**. `Delete` từ Phase 14 xoá được cả project đang `processing` (xem mục 37) — không chỉ project đứng yên như trước.
+
+**Cập nhật (Phase 15, ngoài phạm vi V1 gốc):** row Home (và row Queue tab — mục 6.4, dùng chung component `ProjectRow.tsx` mới tách ra từ `ProjectsListPage.tsx`) đổi tên action thứ 2 thành **Retry Failed**, chỉ enable khi `status` là `failed`/`completed_with_errors` — **`paused` bị bỏ khỏi điều kiện enable**, theo yêu cầu trực tiếp của user (đã xác nhận lại 2 lần, biết rõ hệ quả). Bấm vào vẫn điều hướng tới `/projects/:id/processing` như cũ, nhưng project `paused` giờ không còn nút hành động nào ở đó nữa (mục 8.6) nên link Resume cũ cho `paused` sẽ dẫn tới 1 trang không làm được gì — vì vậy bị disable thẳng ở đây thay vì để user bấm vào ngõ cụt.
+
+**Cập nhật (Phase 15, tiếp) — thêm action thứ 4 "Open in Folder":** row không còn đúng 3 action nữa — thêm **Open in Folder** giữa Retry Failed và Delete, chỉ enable khi `status` là `completed`/`completed_with_errors`. Dùng lại đúng flow "Show in Finder" đã có sẵn ở Export tab (mục 8.7): `export.getFolderPath(projectId)` lấy đường dẫn rồi `export.showInFinder(folderPath)` mở lên — không thêm IPC channel mới, không phải hành động "export thủ công" (export vẫn tự động 100% khi Run All xong, mục 21) mà chỉ là lối tắt mở nhanh thư mục đã ghi sẵn ngay từ Home/Queue thay vì phải mở project → vào tab Export.
+
+**Cập nhật (Phase 15, tiếp) — nút "Delete All" mới ở header Dashboard:** theo yêu cầu trực tiếp của user. Xoá **toàn bộ** project đang hiển thị trong danh sách Recent Projects lúc bấm (tức project không nằm trong Run Queue, xem ngay ở trên) — không đụng tới project đang `queued`/`running` trong Queue tab, giữ đúng ranh giới "Dashboard chỉ hiển thị/thao tác trên project không thuộc Queue" đã có. Chỉ hiện nút khi danh sách không rỗng. Có modal xác nhận riêng (đếm số project sẽ xoá), bấm Delete All thì lặp qua từng project gọi `projects.delete()` (fire-and-forget, cùng cơ chế `DeleteProjectModal`) + `markDeleted()` optimistic ngay lập tức — không phải 1 IPC bulk-delete mới, chỉ là gọi lại đúng IPC xoá-từng-project có sẵn nhiều lần.
 
 **Status/Progress thật (Phase 9, xác nhận lại Phase 10):** `ProjectsListPage.tsx` không dùng giá trị tĩnh — đọc thẳng `ProjectSummary` (`ipc-types.ts`) trả về từ `projects.list()` → `ProjectService.list()` → `listProjectSummaries()` (`src/main/db/queries/projects.queries.ts`), 1 query SQL tính `srtCount`/`characterCount`/`characterPromptDone`/`scenePromptDone`/`progressPercent` trực tiếp từ `srt_blocks`/`characters`/`character_prompts`/`scene_prompts` mỗi lần Home load lại — không có bảng cache/denormalize riêng. `progressPercent` dùng đúng công thức `(character prompt success + scene prompt success) / (characters + srt blocks)`, khớp với công thức Overview (mục 8.1) và Processing tab (mục 8.6) để 3 nơi không bao giờ lệch số nhau.
 
@@ -512,6 +552,40 @@ Không chờ pipeline hoàn thành mới lưu.
 
 **Audit đủ 9/9 (Phase 10, thật):** rà soát lại toàn bộ 9 sự kiện bằng cách đọc code từng service — không có sự kiện nào sót, không cần sửa gì thêm cho autosave tự thân. Settings project đổi (Advanced Settings) xác nhận ghi ngay khi bấm Save (`updatePipelineSettings`), không debounce. 6/9 sự kiện thuộc pipeline (Character Detection/Character Prompt/Scene Prompt/task lỗi/pause/complete) đã có unit test cover sẵn từ Phase 6-9 (`characterService.test.ts`, `scenePromptService.test.ts`, `pipelineService.test.ts` — bao gồm case `completed_with_errors`, pause giữa chừng rồi Resume, cancel). Audit này phát hiện 1 bug liên quan (không phải ở chính cơ chế autosave mà ở cách đọc lại dữ liệu để hiển thị) — xem "Implementation thật (Phase 10)" ở mục 8.1.
 
+## 6.4. Run Queue (Phase 14 — ngoài phạm vi V1 gốc)
+
+**Không có trong spec.md gốc.** Tính năng mới hoàn toàn, phát sinh trực tiếp từ yêu cầu của user trong lúc tự chạy/test app thật trên máy sau khi V1 đã hoàn thành ở Phase 13 — trùng đúng ý "Batch controls" đã liệt kê sẵn ở mục 40 Roadmap (V1.1), làm sớm hơn kế hoạch.
+
+**Yêu cầu:** cho phép xếp hàng nhiều project để chạy Run All tuần tự, tự động — project kế tiếp bắt đầu ngay khi project hiện tại kết thúc (thành công hay thất bại đều tính là "kết thúc", không chặn hàng đợi).
+
+**Cách thêm vào queue:** duy nhất qua nút **"Add to Queue"** trên form New Project lúc tạo project mới (mục 6.1) — **không có** cách thêm 1 project *đã tồn tại* vào queue từ Home hay từ trong chính project đó (từng có action "Add to Queue" ở Home row một thời gian ngắn trong lúc phát triển, đã bị xoá lại theo yêu cầu — xem mục 6.2).
+
+**Trang Queue** (route `/queue`, mục trong sidebar Home, cạnh "Projects"/"New Project"/"Settings"): danh sách project đang `queued`/`running` theo đúng thứ tự FIFO, item `running` (nếu có, luôn đứng đầu danh sách) hiện icon xoay. Tên project bấm vào điều hướng thẳng tới tab Processing để xem chi tiết từng task.
+
+**Cập nhật (Phase 20, ngoài phạm vi V1 gốc, 2026-08-11 — theo yêu cầu trực tiếp user):** nút **Remove** riêng cho item `queued` (mô tả gốc ở trên) đã bị **xoá khỏi UI** — đứng cạnh action **Delete** chuẩn của `ProjectRow` (dùng chung cho mọi row Home/Queue), 2 nút cùng đọc như "xoá" nhưng hành vi khác nhau (Remove chỉ bỏ khỏi hàng đợi, giữ nguyên project; Delete xoá hẳn project) — gây nhầm lẫn. Giờ **Delete là đường duy nhất** để lấy 1 project ra khỏi Queue: `projects.ipc.ts`'s delete handler đã tự `getQueueService().remove(id)` trước khi xoá project (có sẵn từ Phase 14), nên Delete vẫn xử lý đúng "gỡ khỏi hàng đợi" — chỉ khác là project bị xoá hẳn luôn, không giữ lại được để queue lần sau. IPC `queue.remove`/`useQueueStore.remove()` **vẫn còn nguyên**, chỉ không còn UI nào gọi tới — cùng convention "giữ IPC, bỏ nút" đã áp dụng xuyên suốt từ Phase 14.
+
+**Implementation thật (Phase 14):**
+- **`QueueService`** (`src/main/services/QueueService.ts`, mục 4) — thuần logic, không đụng Electron/DB, nhận `runProject` như 1 callback được inject từ `queue.ipc.ts` (không giữ tham chiếu `PipelineService` trực tiếp) để unit-test độc lập bằng fake function. Giữ `queued: string[]` (FIFO) + `currentProjectId: string | null`, vòng lặp `drain()` (`while`-loop, không phải đệ quy) rút từng project ra chạy, guard tái nhập bằng 1 boolean `draining` duy nhất — `add()` gọi giữa lúc `drain()` đang chạy chỉ push vào mảng rồi return ngay, vòng lặp đang chạy tự nhặt item mới ở lượt kế tiếp. Lỗi 1 project (`runProject` reject) bị bắt và log, **không** làm hỏng `drain()` — đúng yêu cầu "lỗi không chặn hàng đợi".
+- **Chia sẻ đúng 1 `PipelineService` instance** giữa chạy tay (`pipeline.ipc.ts`) và chạy qua queue (`queue.ipc.ts`) — thêm `getPipelineService()` (singleton getter, cùng pattern `getDatabase()` ở `DatabaseService.ts`) vì 2 nơi này **phải** dùng chung 1 `controllers` map (mục 37) để guard "đang chạy" và Delete-while-running hoạt động đúng bất kể project được khởi động từ đâu.
+- **Race condition đã fix:** 1 project đang nằm trong queue (đã `queued`, chưa tới lượt `running`) vẫn có `projects.status` chưa đổi (còn `draft`/`ready`/...), nên nếu không kiểm tra thêm, user vẫn bấm Run All thủ công được ở TopBar/Processing tab của chính project đó — chạy đè lên lượt của queue. Fix: `canRun` ở cả 2 nơi thêm điều kiện `!isQueued` (đọc từ `useQueueStore`, không chỉ dựa vào `status`).
+- **In-memory only, không có bảng riêng trong schema.md** — quyết định có chủ đích (không phải thiếu sót): queue mất khi tắt app, không cần khôi phục lại giữa các phiên làm việc.
+- **Kênh IPC/store:** `queue.add`/`queue.remove`/`queue.list`/`queue.onUpdate` (mục 4.2), `useQueueStore` (Zustand, Renderer, cùng pattern singleton-subscription với `usePipelineStore`).
+- Verify: unit test `tests/unit/queueService.test.ts` (8 case — FIFO, lỗi không chặn queue, `remove()` chỉ xoá được item `queued`, add-dedupe cho cả item `queued` lẫn `running`, thứ tự `list()`, re-entrancy, callback), `vitest` 233 → 241 rồi 243/243 sau khi cộng thêm test cho `stopAndWait()` (mục 37).
+
+## 6.5. Channels (Phase 17 — ngoài phạm vi V1 gốc)
+
+**Không có trong spec.md gốc.** Yêu cầu trực tiếp của user: mỗi channel có 1 bộ setting riêng (Max Characters/Duration/Model/3 prompt template/Scene Concurrency/Scene Batch Size — đúng tập field project đã tự giữ riêng từ trước, mục 6.1), setting chung (Settings > General/Prompts) đổi vai trò thành default khi tạo channel mới (thay vì default khi tạo project mới như trước), project thuộc channel nào dùng đúng setting của channel đó.
+
+**Cách hoạt động:** project chọn đúng 1 channel lúc tạo (`NewProjectPage.tsx`, dropdown bắt buộc) — toàn bộ setting của channel đó được **copy 1 lần** vào field riêng của project ngay lúc tạo (cùng pattern `AppSettings` → project đã có từ Phase 4), **không phải tham chiếu sống**: sửa setting channel sau đó không ảnh hưởng ngược project đã tạo. **Không đổi được channel của project sau khi tạo** — cố định vĩnh viễn, theo yêu cầu trực tiếp của user (đã xác nhận qua `AskUserQuestion` trước khi implement).
+
+Model/3 prompt template của channel còn được dùng trực tiếp mỗi lần Run All/Resume/Retry Failed (không chỉ lúc tạo project) — `resolvePipelineRuntime()` (mục dưới) đọc model/prompt từ channel của project thay vì `AppSettings` global, nên đổi setting channel *trước lần Run đầu tiên* của 1 project vẫn có tác dụng (Prompt Snapshot, mục 32, vẫn chỉ khoá lại đúng 1 lần ở lần Run đầu tiên như cũ — không đổi cơ chế đó).
+
+**Trang Channels** (route `/channels`, mục trong sidebar Home, cạnh "Queue"/"Settings"): danh sách channel dạng card — tên, số project đang thuộc channel đó, tóm tắt setting. Action **New Channel** (`/channels/new`, prefill từ `AppSettings` hiện hành — Settings > General/Prompts — chỉnh được trước khi lưu), **Edit** (`/channels/:channelId/edit`, sửa mọi field kể cả tên), **Delete** (chỉ xoá được channel không còn project nào tham chiếu, và không xoá được nếu đó là channel cuối cùng còn lại trong hệ thống — New Project luôn cần ít nhất 1 channel để chọn).
+
+**Migration `0004_add_channels`** tạo sẵn đúng 1 channel `"Default"` và gán toàn bộ project đã tồn tại trước Phase 17 vào đó — mọi project trong hệ thống luôn thuộc đúng 1 channel, không có trạng thái "project không channel" nào phải xử lý ở nơi khác. Chi tiết schema đầy đủ: `context/schema.md` (bảng `channels`, Changelog Phase 18).
+
+**Vilao API key KHÔNG theo channel** — vẫn dùng chung 1 key cho toàn app (Settings > Vilao API, mục 5.1), không nằm trong phạm vi setting của channel.
+
 ---
 
 # 7. Giao diện chính
@@ -538,7 +612,11 @@ UI tổng thể:
 
 Settings là màn riêng.
 
-**Implementation thật (Phase 9):** nút `[ Run All ]` ở TopBar (`src/renderer/components/layout/TopBar.tsx`) đổi nhãn/hành vi theo `projects.status`: **Run All** khi `draft`/`ready`, **Resume** khi `paused`, **Retry Failed** khi `failed`/`completed_with_errors`, disabled kèm tooltip lý do (mục 38) khi chưa đủ điều kiện chạy. Khi `status=processing`, nút Run All ẩn đi, thay bằng nhãn "Processing…" + 2 nút **Pause**/**Cancel** (mục 37). Khi `status=completed`, thay bằng badge tĩnh "✓ Completed" (không phải nút bấm được). Model hiển thị cạnh tên project đổi thành `selectedModelSnapshot` sau lần Run đầu tiên (mục 32) thay vì `selectedModel` sống.
+**Implementation thật (Phase 9):** nút `[ Run All ]` ở TopBar (`src/renderer/components/layout/TopBar.tsx`) đổi nhãn/hành vi theo `projects.status`: **Run All** khi `draft`/`ready`, **Resume** khi `paused`, **Retry Failed** khi `failed`/`completed_with_errors`, disabled kèm tooltip lý do (mục 38) khi chưa đủ điều kiện chạy. Khi `status=processing`, nút Run All ẩn đi, thay bằng nhãn "Processing…" + ~~2 nút **Pause**/**Cancel**~~ (xem cập nhật Phase 14 ngay dưới, mục 37). Khi `status=completed`, thay bằng badge tĩnh "✓ Completed" (không phải nút bấm được). Model hiển thị cạnh tên project đổi thành `selectedModelSnapshot` sau lần Run đầu tiên (mục 32) thay vì `selectedModel` sống.
+
+**Cập nhật (Phase 14, ngoài phạm vi V1 gốc):** khi `status=processing`, 2 nút Pause/Cancel **bị xoá hẳn**, thay bằng đúng 1 nút **Delete** duy nhất (`variant="danger"`) — xoá được project ngay cả khi đang chạy (mục 37). Lý do: Pause và Cancel vốn gọi cùng 1 hàm ở backend (`PipelineService.pause()`), không có khác biệt hành vi thật nào giữa 2 nút — giữ cả 2 chỉ dư thừa UI. `pipeline.pause`/`pipeline.cancel` (IPC, mục 4.2) vẫn còn nguyên, chỉ không còn nút nào gọi tới.
+
+**Cập nhật lớn (Phase 15, ngoài phạm vi V1 gốc) — nút Resume bị xoá hẳn:** khi `status=paused`, TopBar không còn hiện nút `[Run All]` với nhãn "Resume" nữa — thay bằng đúng 1 badge tĩnh **"Paused"** (không phải nút bấm được, cùng kiểu badge tĩnh với "✓ Completed"). Lý do: theo yêu cầu trực tiếp của user (đã xác nhận lại việc hiểu rõ hệ quả — 1 project `paused` giờ không còn cách nào chạy tiếp được từ UI). `runLabel` giờ chỉ còn 2 giá trị: **Run All** (`draft`/`ready`, và mặc định khi không rơi vào case còn lại) hoặc **Retry Failed** (`failed`/`completed_with_errors`) — case `paused` không bao giờ chạm tới nhánh render nút nữa vì đã tách badge riêng trước đó. `onRunOrResume`/`canRun`/`pipeline.run()` bên dưới không đổi gì — chỉ đơn giản không còn đường nào từ UI gọi tới chúng khi `status=paused`.
 
 ---
 
@@ -574,6 +652,8 @@ Progress         78%
 
 **Bug fix `failedTaskCount` (Phase 10):** trong lúc audit, phát hiện `listProjectSummaries()` (`ProjectSummary.failedTaskCount`, mục 6.2) trước đó tính sai — chỉ đếm `pipeline_tasks.status='failed'`, nhưng bảng này (mục 25) chỉ có row cho 3 task cấp dự án (`SPLIT_SRT`/`DETECT_CHARACTERS`/`GENERATE_CHARACTER_PROMPTS`), không phản ánh số lượng Character Prompt/Scene Prompt lỗi ở cấp đơn vị — đúng ý "Failed" trong ví dụ trên. Sửa lại thành tổng `character_prompts.status='failed'` + `scene_prompts.status='failed'`, khớp cách Overview tính ở trên. Một lỗi ở coarse pipeline_tasks (SPLIT_SRT/DETECT_CHARACTERS thất bại, chặn cả pipeline trước khi có character_prompts/scene_prompts nào) không bị đếm trùng vào đây — nó đã hiện rõ qua `projects.status = 'failed'` ở nơi khác (TopBar, Project History badge, mục 6.2/7).
 
+**Bug fix real-time update (Phase 16, 2026-08-10 — user report):** "project chạy xong mà không được cập nhật khi đang ở project detail, thoát ra vào dashboard mới thấy thành công". Nguyên nhân: `OverviewPage.tsx` (trang mặc định khi mở project, mục 7) chỉ fetch 9 field trên **đúng 1 lần lúc mount**, không subscribe kênh live nào — khác `TopBar.tsx`/`ProcessingPage.tsx` (mục 8.6) vốn đã subscribe `usePipelineStore`/`scenePrompts.onProgress` từ Phase 9. Sửa bằng cách áp đúng pattern đã chứng minh hoạt động ở `ProcessingPage.tsx`: `OverviewPage` giờ cũng subscribe `usePipelineStore` (refetch khi `tasks` đổi — bắt được cả run kích hoạt qua Run Queue, mục 6.4, không chỉ tự bấm Run All), lắng nghe `scenePrompts.onProgress` để merge kết quả batch trực tiếp, và refetch khi `isRunning` chuyển về false. Verify bằng driver Electron/Playwright thật (không mock) — xác nhận `refresh()` gọi lại nhiều lần trong vòng &lt;100ms sau khi 1 task thật đổi trạng thái, khớp đúng lúc backend thật sự chạy, không cần rời trang.
+
 ## 8.2. Transcript
 
 Text editor lớn.
@@ -589,6 +669,8 @@ Chức năng:
 Không cần Rich Text.
 
 **Implementation thật (Phase 4):** Paste dùng `navigator.clipboard.readText()` ngay trong Renderer (không qua IPC — chỉ là thao tác UI, không phải business logic/API key); nếu bị trình duyệt/OS chặn quyền đọc clipboard, hiển thị thông báo yêu cầu paste trực tiếp (Cmd+V) thay vì crash. Select All gọi `textarea.select()`. Load `.txt` đi qua IPC `projects.loadTranscriptFile()` — Main mở `dialog.showOpenDialog` (filter `.txt`) và đọc file bằng `readFileSync`, trả nội dung string hoặc `null` nếu người dùng cancel; Renderer không có quyền filesystem trực tiếp, đúng kiến trúc mục 4.1. Character count/word count tính live từ state, không cần round-trip IPC.
+
+**Cập nhật lớn (Phase 15, ngoài phạm vi V1 gốc) — cả 4 nút Paste/Select All/Clear/Load .txt bị xoá khỏi `TranscriptPage.tsx`:** theo yêu cầu trực tiếp của user, đã xác nhận lại 2 lần biết rõ hệ quả. Paste/Select All/Clear vẫn làm được bằng thao tác tay ngay trong textarea (Ctrl+V/Ctrl+A/xoá text chọn), không mất chức năng thật — chỉ mất nút tiện dụng. **Load .txt mất hẳn, không có thao tác thay thế nào khác trong app** để nạp file `.txt` vào transcript của 1 project đã tồn tại. IPC `projects.loadTranscriptFile()` vẫn còn nguyên (không xoá, cùng convention Phase 14 — chỉ không còn UI nào gọi tới). Character count/Word count không đổi, vẫn hiển thị.
 
 ## 8.3. SRT
 
@@ -606,6 +688,8 @@ Không cần chỉnh timestamp chính xác.
 **Implementation thật (Phase 5):** `SrtPage.tsx` hiển thị danh sách 1 cột dọc (không phải lưới nhiều cột — đổi từ layout Stitch gốc để dễ đọc block dài nhiều dòng), mỗi card gồm index, `HH:MM:SS,mmm --> HH:MM:SS,mmm` (đúng format mục 22), text, character count. Search lọc theo text hoàn toàn ở Renderer (client-side, không round-trip IPC). Vì `pipeline.run`/Run All chưa nối (đến Phase 9), tab này có thêm nút tạm thời **Split SRT** để trigger `srt.split` thủ công.
 
 **Cập nhật (Phase 9):** Run All thật đã có (mục 36) và cũng chạy `SPLIT_SRT` như bước đầu tiên, nhưng nút **Split SRT** ở đây **không bị xoá** — giữ lại làm trigger thủ công độc lập (hữu ích khi chỉnh transcript rồi muốn tách lại SRT ngay mà chưa muốn chạy cả pipeline). Quyết định khác với kế hoạch ban đầu ("sẽ được thay bằng Run All").
+
+**Cập nhật (Phase 14, ngoài phạm vi V1 gốc):** nút **Split SRT** rốt cuộc **cũng bị xoá** — đảo ngược quyết định Phase 9 ở trên, theo yêu cầu trực tiếp của user sau khi Run All đã chứng minh đủ dùng trong thực tế. Tab giờ chỉ hiển thị block đã có sẵn, thuần đọc (`srt.list`), không còn action nào khác. `srt.split` (IPC, mục 4.2) vẫn còn nguyên ở Main, chỉ không còn nút UI nào gọi tới — Run All (mục 36) là đường duy nhất tạo SRT block.
 
 ## 8.4. Characters
 
@@ -628,6 +712,8 @@ Sau khi pipeline xong người dùng có thể xem thông tin đã tạo.
 **Implementation thật (Phase 7):** Thêm nút tạm thời **Generate Character Prompts** (cạnh Detect Characters, cùng pattern nút tạm đứng thay Run All, xem mục 15) — disable kèm tooltip khi chưa có `characters` hoặc prompt Character Generation thiếu placeholder `{{CHARACTERS}}` bắt buộc (mục 27). Section Character Prompt trên mỗi card hiển thị 1 trong 3 trạng thái thay vì luôn trống: chưa có row (placeholder "Not generated yet"), `status=failed` (hiện `error` + nút **Retry** riêng cho đúng nhân vật đó, gọi `characters.retryPrompt` — không ảnh hưởng nhân vật khác), `status=success` (hiện prompt tiếng Anh + nút **Copy**). Bấm Detect Characters lại sẽ clear prompt state ở Renderer (Character Database mới không còn khớp prompt cũ) — chờ người dùng bấm Generate lại, không tự động gọi lại LLM.
 
 **Cập nhật (Phase 9):** cả 2 nút **Detect Characters**/**Generate Character Prompts** vẫn giữ nguyên, không bị Run All thay thế — cùng quyết định như mục 8.3's Split SRT, phục vụ việc chạy lại/kiểm tra riêng từng bước mà không cần chạy cả pipeline. `generatePrompts()`/`detect()` vẫn luôn xử lý lại toàn bộ mỗi lần bấm (không bỏ qua nhân vật đã `success`) — khác với Scene Generation (mục 17.1) đã có cơ chế bỏ qua khi Resume.
+
+**Cập nhật (Phase 14, ngoài phạm vi V1 gốc):** cả 2 nút **Detect Characters** và **Generate Character Prompts** (cùng modal xác nhận Regenerate ở mục 20) **bị xoá hẳn** — cùng quyết định/lý do như Split SRT ở mục 8.3, đảo ngược quyết định Phase 9. Nút **Retry** riêng từng nhân vật (khi `character_prompts.status=failed`) **vẫn giữ nguyên** — khác mục đích, sửa lỗi 1 nhân vật lẻ chứ không phải trigger thủ công thay Run All. `characters.detect`/`characters.generatePrompts` (IPC, mục 4.2) vẫn còn nguyên ở Main, chỉ không còn nút UI nào gọi tới nữa — Run All (mục 36) là đường duy nhất chạy 2 bước này.
 
 ## 8.5. Image Prompts
 
@@ -658,6 +744,8 @@ Có:
 **Live progress (phát sinh ngoài spec gốc, thêm sau khi user yêu cầu trong lúc test thủ công Phase 8):** trong lúc `Generate Image Prompts` đang chạy, phía dưới nút hiện "Batch X / Y" + "N / M prompts completed" kèm thanh 2px `emerald-success` (đúng DESIGN.md "Progress Indicators") — cập nhật sau mỗi batch qua `appApi.scenePrompts.onProgress()` (xem mục 17), đồng thời merge kết quả của batch đó vào danh sách ngay (không đợi `generate()` chạy xong toàn bộ mới thấy prompt xuất hiện). Đây là bản rút gọn của khái niệm "Processing" (mục 8.6) áp dụng riêng cho bước Scene Generation, đi trước Phase 9's Processing tab đầy đủ.
 
 **Cập nhật (Phase 9):** nút **Generate Image Prompts** vẫn giữ nguyên (cùng quyết định như 8.3/8.4) — nhưng hành vi bên dưới đổi: `ScenePromptService.generate()` giờ **bỏ qua** (không gọi LLM) bất kỳ batch nào đã có mọi block `status=success` (mục 17.1/19.3), nên bấm lại nút này sau khi đã thành công một phần giờ chỉ xử lý phần còn thiếu/lỗi, không gọi lại LLM cho scene đã xong — khác hành vi ban đầu ("regenerate toàn bộ mỗi lần bấm"). Chạy lại thật sự ép toàn bộ (kể cả scene đã `success`) là tính năng Regenerate riêng, để dành Phase 12 (mục 20).
+
+**Cập nhật lớn (Phase 15, ngoài phạm vi V1 gốc) — nút Generate Image Prompts bị xoá:** đây là nút tạm-thời-thay-Run-All cuối cùng còn sót lại — 3 nút cùng loại (Split SRT/Detect Characters/Generate Character Prompts, mục 8.3/8.4) đã bị dọn ở Phase 14 nhưng nút này bị bỏ sót, giờ dọn nốt theo đúng quyết định cũ ("Run All đã đủ dùng trong thực tế nên không cần nữa", mục 40). Cùng theo đó: banner cảnh báo thiếu placeholder Scene Generation prompt (`missingPlaceholders`) cũng bị xoá — Image Prompts giờ **thuần hiển thị kết quả**, đúng pattern SrtPage/CharactersPage đã áp dụng, validation trước Run chỉ còn ở TopBar (mục 38). Vẫn giữ nguyên: card-per-block, nút **Retry** riêng từng SRT lỗi, **Copy**/**Copy All**, và cập nhật live theo `scenePrompts.onProgress()` (mục 17) bất kể ai kích hoạt run (TopBar/Processing hay Run Queue mục 6.4) — không còn gắn với trạng thái "đang generate" cục bộ của nút đã xoá. **Copy All** đổi sang gọi thẳng `formatImagePromptsFile()` (`src/shared/exportFormat.ts`, mục 24) thay vì tự dựng format riêng — trước đó 2 nơi định dạng độc lập đã lệch nhau sau lần đổi format mục 24 (Phase 15), giờ chỉ còn 1 nguồn duy nhất.
 
 ## 8.6. Processing
 
@@ -693,13 +781,19 @@ Actions:
 - Cancel
 - Retry Failed
 
+**Cập nhật (Phase 14, ngoài phạm vi V1 gốc):** **Pause** và **Cancel** bị xoá khỏi Actions — xem "Cập nhật (Phase 14)" ở mục 7/37. **Resume** và **Retry Failed** không đổi.
+
+**Cập nhật lớn (Phase 15, ngoài phạm vi V1 gốc) — thay thế câu "Resume... không đổi" ngay trên:** **Resume bị xoá khỏi Actions.** Khi `status=paused`, tab Processing không còn nút hành động nào — thay bằng badge tĩnh "Paused" (cùng cách TopBar mục 7 làm). **Retry Failed** (`failed`/`completed_with_errors`) là action chạy-tiếp duy nhất còn lại. Xem mục 7 để biết chi tiết implementation (dùng chung `runLabel`/logic render với TopBar).
+
 **Implementation thật (Phase 9):** `ProcessingPage.tsx` — chưa có Stitch screen riêng cho breakdown "Scene 001/002/..." nhưng có screen "Pipeline Status" (bento grid 4 card trạng thái + progress bar + activity log) dùng làm layout tham khảo (`get_screen` trước khi code, theo đúng quy trình bắt buộc). Layout thật: progress bar tổng (`vilao-blue`), bento grid 4 card trạng thái (Split SRT/Detect Characters/Generate Character Prompts/Scene Generation), danh sách "Scene 00N" bên dưới — thay hẳn "Activity Log" giả lập trong mockup Stitch gốc bằng danh sách scene thật (dữ liệu thật quan trọng hơn hiệu ứng terminal giả).
 
 3 card đầu đọc thẳng `pipeline.listTasks()` (3 row `pipeline_tasks` thật, mục 25). Card **Scene Generation** + danh sách "Scene 00N" **không** đọc `pipeline_tasks` — đọc thẳng `scenePrompts.list()` (đã có sẵn từ Phase 8, đã có `status`/`attempts`/`error` per-block) để tránh 2 nguồn sự thật song song cho cùng 1 trạng thái (xem mục 25).
 
 Status icon thật chỉ có 4/6 trạng thái được lưu/hiện trực tiếp: `○ Pending` (chưa có row, hoặc row `pending`), `● Running` (chỉ 3 card đầu có được — `pipeline_tasks` được ghi `running` thật trước khi gọi service; `character_prompts`/`scene_prompts` không có trạng thái `running` persist vì các batch chỉ ghi kết quả cuối cùng, không ghi từng lần thử), `✓ Success`, `! Failed`. **`↻ Retrying` chỉ hiện được cho scene** (đọc `attempts > 1` khi `status=failed`, hiện `(Nx)` cạnh nhãn Failed) — không có "đang retry" live cho 3 card cấp dự án vì lý do trên. **`— Skipped` không được phân biệt riêng** với `✓ Success` — schema.md ghi rõ đây là trạng thái suy ra ở UI, nhưng không có cách phân biệt "vừa skip trong lượt Resume này" với "đã success từ trước" nếu không thêm state phiên làm việc riêng; chấp nhận đơn giản hoá, cả 2 đều hiện `✓ Success`.
 
-Actions Pause/Resume/Cancel/Retry Failed dùng chung `usePipelineStore` (Zustand, module-level singleton) với TopBar (mục 7) — bấm từ tab nào cũng phản ánh đúng trạng thái ở tab kia. **Retry Failed và Resume là cùng 1 lời gọi** (`pipeline.run`/`resume`/`retryTask` đều trỏ `runProject()`, mục 19.3/36) — không có logic "chỉ retry đúng phần failed, bỏ qua pending" tách biệt, vì gating trong `runProject()` đã tự nhiên chỉ làm lại phần chưa xong.
+Actions Resume/Retry Failed (Pause/Cancel đã xoá, xem Phase 14 ở trên) dùng chung `usePipelineStore` (Zustand, module-level singleton) với TopBar (mục 7) — bấm từ tab nào cũng phản ánh đúng trạng thái ở tab kia. **Retry Failed và Resume là cùng 1 lời gọi** (`pipeline.run`/`resume`/`retryTask` đều trỏ `runProject()`, mục 19.3/36) — không có logic "chỉ retry đúng phần failed, bỏ qua pending" tách biệt, vì gating trong `runProject()` đã tự nhiên chỉ làm lại phần chưa xong. Khi `status=processing`, thay vì Pause/Cancel, tab hiện đúng 1 nút **Delete** (mục 37) — dùng chung `DeleteProjectModal` (component mới, `src/renderer/components/DeleteProjectModal.tsx`) với TopBar và Home (mục 6.2).
+
+**Bug fix real-time update (Phase 20, 2026-08-11 — user report, cùng loại bug đã vá ở Overview mục 8.1 Phase 16):** "Scene Generation xong nhưng không cập nhật real time, phải out project ra mới nhận success". Nguyên nhân: `ProcessingPage.tsx` chỉ refetch `srtBlocks`/`characters`/`characterPrompts` khi `isRunning` (cờ riêng của cửa sổ Renderer, chỉ đúng khi *chính cửa sổ đó* gọi Run All trực tiếp) chuyển `true`→`false` — nhưng cách duy nhất để chạy 1 project **mới** là qua Add to Queue (mục 6.4), nơi `isRunning` của cửa sổ đang xem Processing không bao giờ thành `true`, nên dữ liệu bị đóng băng ở lúc mount (thường là rỗng) suốt cả lượt chạy. Sửa bằng cách áp đúng pattern `OverviewPage.tsx` đã có từ Phase 16: refetch thêm khi `tasks` (từ `usePipelineStore`) đổi — kênh này bắn cho cả 2 trường hợp (chạy trực tiếp lẫn qua Queue). Verify bằng cách tự dựng 1 instance Electron cô lập (Playwright `_electron`, `--user-data-dir` riêng không đụng dữ liệu thật, mock `global.fetch` trong Main để không gọi Vilao thật) — replay đúng luồng Add to Queue, xác nhận card Scene Generation + danh sách Scene Tasks cập nhật live từng batch mà không cần rời trang.
 
 ## 8.7. Export
 
@@ -707,9 +801,16 @@ Hiển thị preview file sẽ export.
 
 Nút:
 
-**Export Project**
+~~**Export Project**~~ — đã xoá ở Phase 14, xem "Cập nhật (Phase 14)" bên dưới. Export giờ **tự động**, không còn nút thủ công.
 
 **Implementation thật (Phase 11):** không có Stitch screen cho Export (`generate_screen_from_text` timeout không tạo ra screen mới, cùng hiện tượng đã note ở Characters/Image Prompts) — `ExportPage.tsx` build thẳng bằng Tailwind theo token DESIGN.md, tái dùng pattern khối preview monospace đã có ở `ImagePromptsPage`. Layout thật: card "Output Folder" liệt kê cây thư mục `Project_Name/` + tên 3 file, 3 card preview (1/file) hiện tối đa 3 entry đầu — dùng **đúng** hàm format trong `src/shared/exportFormat.ts` mà `ExportService` dùng để ghi file thật, nên preview không bao giờ lệch với file xuất ra — kèm `+N more` khi còn entry chưa hiện. Nút **Export Project** (disabled khi chưa có `srt_blocks`) gọi `export.project()`, banner thành công `emerald-success` + nút **Show in Finder** xuất hiện sau khi ghi file xong. Home (Project History, mục 6.2) cũng có action Export riêng ở mỗi row, dùng chung `export.project()`/`export.showInFinder()`, disabled khi project chưa có `srt_blocks`.
+
+**Cập nhật lớn (Phase 14, ngoài phạm vi V1 gốc) — Export tự động hoá hoàn toàn, thay thế mô tả Phase 11 ở trên:**
+- **Nút "Export Project" bị xoá hẳn**, cùng với đó `export.project()` (IPC) cũng bị xoá luôn (không giữ lại như các trường hợp khác trong Phase 14 — vì hàm này thật sự không còn ý nghĩa gì khi không còn ai gọi tới cả trực tiếp lẫn gián tiếp). Thay bằng `export.getFolderPath(projectId)`, chỉ đọc (mục 4.2).
+- **`PipelineService.runProject()` tự gọi `ExportService.export()`** ngay sau khi Run All đạt `completed`/`completed_with_errors` (mục 21/36) — ghi file xảy ra ở Main, không qua hành động nào của Renderer nữa. Lỗi ghi file (ví dụ Default Export Folder không còn quyền ghi) là best-effort: log ra console, **không** làm cả run bị coi là fail.
+- **Export tab giờ chỉ còn preview + banner "Exported to ..."** (hiện khi `project.status` là `completed`/`completed_with_errors` **và** đã xác định được `getFolderPath()`) kèm nút **Show in Finder** — không có hành động nào khác để user bấm trên tab này nữa.
+- **Home (mục 6.2) không còn action Export/Show in Finder riêng ở mỗi row** — dư thừa, vì export đã tự động khi Run All xong.
+- Xem mục 21 để biết chi tiết **Default Export Folder** (nơi file được ghi vào).
 
 ---
 
@@ -728,12 +829,14 @@ Advanced
 
 # 10. General Settings
 
-## 10.1. Max Characters Per SRT
+## 10.1. Average Characters Per SRT + Variance %
+
+**Cập nhật thật (Phase 19 — Post-V1, ngoài phạm vi V1 gốc, 2026-08-11, theo yêu cầu trực tiếp user):** "Maximum characters per SRT" đổi thành **"Average characters per SRT"** — không còn là giới hạn cứng, mà là mục tiêu trung bình, đi kèm setting mới **"Variance (±%)"** để thuật toán chia SRT (mục 11) co giãn quanh mức trung bình đó thay vì cắt cứng, tránh câu bị cắt quá ngắn. Đây là schema change thật (đổi tên cột `max_characters` → `avg_characters`, thêm cột `variance_percent`) — đã hỏi lại qua `AskUserQuestion` trước khi implement theo CLAUDE.md. Chi tiết đầy đủ: `context/schema.md` Changelog Phase 19, mục 11.2/11.3/11.5 dưới đây.
 
 Tên setting:
 
 ```text
-Maximum characters per SRT
+Average characters per SRT
 ```
 
 Default:
@@ -749,6 +852,30 @@ Cho phép thay đổi.
 ```text
 100 – 2000
 ```
+
+### Variance (±%)
+
+Tên setting:
+
+```text
+Variance (±%)
+```
+
+Default:
+
+```text
+30
+```
+
+Range:
+
+```text
+0 – 90
+```
+
+0 = hành vi ngưỡng cứng như trước Phase 19 (block không bao giờ vượt quá Average). SRT block dao động trong khoảng `[Average × (1 − Variance/100), Average × (1 + Variance/100)]` — ưu tiên đạt ngưỡng dưới của khoảng này trước khi ngắt block, chấp nhận vượt nhẹ ngưỡng trên khi cần, thay vì luôn tôn trọng ngưỡng trên tuyệt đối.
+
+**Không sửa được sau khi project đã tạo** — cùng field `avgCharacters`/`variancePercent` copy 1 lần từ Channel lúc tạo project (mục 6.5), giống hệt `maxCharacters`/`fakeDurationSec` trước đây.
 
 ## 10.2. Fake Duration
 
@@ -775,14 +902,18 @@ Range đề xuất:
 Default:
 
 ```text
-Max retry = 3
+Max retry = 1
 ```
 
-Có thể để trong Advanced Settings.
+**Không còn UI để chỉnh** (mục 33, Phase 16, 2026-08-10 — theo yêu cầu user) — mọi project cố định 1 lần thử/task-batch, không tự động retry.
 
-**Quyết định thật (Phase 4):** Max Retry đặt trong Settings > Advanced, wiring thật để dành Phase 9 (cùng `scene_concurrency`, vì cả 2 đều thuộc pipeline execution tuning). Khác với `maxCharacters`/`fakeSrtDurationSec`, Max Retry **không** có field tương ứng trong `AppSettings` (`context/schema.md`) — mỗi project luôn khởi tạo `max_retry = 3` (hằng số `DEFAULT_MAX_RETRY` trong `ProjectService`), không đọc từ global settings khi tạo project. Thêm field `maxRetry` vào `AppSettings` sẽ là một thay đổi schema, cần hỏi lại trước theo CLAUDE.md — chưa cần thiết ở V1 vì range đề xuất chỉ có 1 giá trị default dùng chung.
+**Quyết định thật (Phase 4):** Max Retry ban đầu đặt trong Settings > Advanced, wiring thật để dành Phase 9 (cùng `scene_concurrency`, vì cả 2 đều thuộc pipeline execution tuning). Khác với `maxCharacters`/`fakeSrtDurationSec`, Max Retry **không** có field tương ứng trong `AppSettings` (`context/schema.md`) — mỗi project luôn khởi tạo `max_retry` từ hằng số `DEFAULT_MAX_RETRY` trong `ProjectService`, không đọc từ global settings khi tạo project. Thêm field `maxRetry` vào `AppSettings` sẽ là một thay đổi schema, cần hỏi lại trước theo CLAUDE.md.
 
 **Wiring thật (Phase 9):** Settings > Advanced > Pipeline Tuning bật form thật (React Hook Form + Zod) cho `maxRetry` (min 1) và `sceneConcurrency` (1–5) — nhưng sửa **project đang mở**, không phải một default toàn cục, vì 2 field này luôn thuộc về 1 project cụ thể (không có ở `AppSettings`, xem trên). Route Settings là route global (`/settings`, ngoài `/projects/:id`) nên trang đọc `useProjectStore.currentProject` (không bị clear khi rời route project) để biết đang sửa project nào — vào Settings từ TopBar (đang có project mở) thì form enable, vào từ Home Sidebar (chưa mở project nào) thì disable kèm hướng dẫn. IPC mới `projects.updatePipelineSettings` (mục 4.2).
+
+**Cập nhật thật (Phase 16, 2026-08-10 — theo yêu cầu user "Để retry là 1, không cần setting nữa"):** `DEFAULT_MAX_RETRY` hạ từ 3 xuống 1; ô "Max Retry" bị xoá khỏi form Pipeline Tuning (chỉ còn Scene Generation Concurrency lúc này). `updatePipelineSettings` IPC/service/cột DB giữ nguyên hoàn toàn (vẫn nhận cả `maxRetry`+`sceneConcurrency` trong 1 lời gọi) — form giờ luôn gửi lại đúng `maxRetry` hiện tại của project (pass-through, không đổi) cùng `sceneConcurrency` vừa sửa, nên không cần đổi IPC shape ở bước này. Chi tiết xem `context/schema.md` Changelog Phase 16.
+
+**Cập nhật thật (Phase 17, cùng ngày 2026-08-10 — thêm setting Scene Generation Batch Size):** `updatePipelineSettings` đổi shape thật — thêm field thứ 3 `sceneBatchSize` (int, 1–20) vào cùng lời gọi. Form Pipeline Tuning thêm ô "SCENE GENERATION BATCH SIZE" ngay dưới Scene Generation Concurrency. Đây là schema change thật (cột mới `projects.scene_batch_size`, migration `0003_add_scene_batch_size`) — đã hỏi lại range hợp lệ qua `AskUserQuestion` trước khi implement theo CLAUDE.md, user chọn 1–20. Chi tiết đầy đủ xem mục 17 và `context/schema.md` Changelog Phase 17.
 
 ---
 
@@ -806,6 +937,13 @@ Phải cố gắng giữ nguyên câu hoàn chỉnh.
 
 ## 11.2. Gom câu
 
+**Cập nhật thật (Phase 19, 2026-08-11):** thay hằng số `maxCharacters` (ngưỡng cứng) bằng khoảng `[min, max]` suy ra từ `avgCharacters`/`variancePercent` (mục 10.1):
+
+```text
+min = avgCharacters * (1 - variancePercent / 100)
+max = avgCharacters * (1 + variancePercent / 100)
+```
+
 Algorithm:
 
 ```text
@@ -814,7 +952,11 @@ currentBlock = ""
 for sentence in sentences:
     candidate = currentBlock + sentence
 
-    if candidate.length <= maxCharacters:
+    if candidate.length <= max:
+        currentBlock = candidate
+    else if currentBlock.length < min:
+        # chưa đạt ngưỡng dưới — vẫn nhét thêm, chấp nhận vượt nhẹ max,
+        # thay vì chốt lại 1 block quá ngắn (yêu cầu trực tiếp của user)
         currentBlock = candidate
     else:
         save currentBlock
@@ -823,19 +965,13 @@ for sentence in sentences:
 
 Nguyên tắc:
 
-> Gom nhiều câu cho tới khi thêm câu tiếp theo sẽ vượt `maxCharacters`.
+> Gom nhiều câu cho tới khi block đạt khoảng `[min, max]` quanh mức trung bình — ưu tiên đạt `min` trước khi ngắt, chấp nhận vượt nhẹ `max` khi cần, thay vì luôn tôn trọng `max` tuyệt đối. `variancePercent = 0` ⇒ `min = max = avgCharacters` ⇒ y hệt hành vi ngưỡng cứng cũ.
 
 ## 11.3. Câu đơn quá dài
 
-Nếu một câu đơn đã lớn hơn `maxCharacters`:
+**Cập nhật (2026-08-11, theo yêu cầu trực tiếp user — rule bắt buộc):** không bao giờ cắt một câu trước khi câu đó thực sự kết thúc (`.`/`?`/`!`/`…`). Nếu một câu đơn đã lớn hơn `max` (mục 11.2), câu đó **vẫn giữ nguyên vẹn, trở thành 1 block riêng của chính nó**, dù vượt `max` bao nhiêu cũng chấp nhận — không hard-cut giữa từ, không cắt tại whitespace, không cắt tại `;`/`:`/`,`.
 
-Ưu tiên split theo:
-1. `;`
-2. `:`
-3. `,`
-4. whitespace gần giới hạn nhất
-
-Chỉ hard-cut ký tự khi không còn lựa chọn phù hợp.
+(Lịch sử: bản đầu tiên có ưu tiên cắt tại `;` rồi `:` rồi `,` rồi whitespace gần giới hạn nhất, chỉ hard-cut khi không còn lựa chọn nào — toàn bộ cơ chế này đã bị bỏ hẳn, xem `src/main/pipeline/splitSrt.ts` — hàm `splitOversizedSentence()` không còn tồn tại.)
 
 ## 11.4. Timeline giả
 
@@ -868,12 +1004,13 @@ Không đại diện timeline thực của video.
 
 ## 11.5. Implementation thật (Phase 5)
 
-`splitTranscriptToSrtBlocks(transcript, maxCharacters, fakeDurationSec)` (`src/main/pipeline/splitSrt.ts`) — pure function, không import Electron/DB nên unit-test trực tiếp được (`tests/unit/srtSplitter.test.ts`). Vài điểm khác biệt/cụ thể hoá so với pseudocode ở 11.1–11.4:
+`splitTranscriptToSrtBlocks(transcript, avgCharacters, variancePercent, fakeDurationSec)` (`src/main/pipeline/splitSrt.ts` — signature đổi ở Phase 19, thêm tham số `variancePercent`, đổi tên `maxCharacters` → `avgCharacters`) — pure function, không import Electron/DB nên unit-test trực tiếp được (`tests/unit/srtSplitter.test.ts`). Vài điểm khác biệt/cụ thể hoá so với pseudocode ở 11.1–11.4:
 
 - **Gom câu (11.2) nối bằng 1 khoảng trắng** giữa các câu/chunk (`current + ' ' + unit`), không phải nối thẳng chuỗi như pseudocode `currentBlock + sentence` — tránh 2 câu dính liền nhau khi hiển thị.
-- **`maxCharacters` đếm theo ký tự thị giác (grapheme cluster), không phải UTF-16 code unit** của JS (`.length`/`.slice()` mặc định). Lý do: `.length` đếm sai với tiếng Việt nếu văn bản ở dạng NFD (dấu tách rời khỏi chữ cái, hay gặp khi copy từ macOS/PDF — 1 chữ có dấu bị tính thành 2+ code unit) và có thể hard-cut cắt đôi 1 ký tự (giữa chữ cái + dấu, hoặc giữa surrogate pair của kanji hiếm/emoji ngoài BMP). Implementation: `transcript.normalize('NFC')` ngay đầu vào, sau đó mọi phép đếm/cắt (ngưỡng gom câu, cửa sổ hard-cut ở 11.3, `character_count` output) đều thao tác trên mảng grapheme cluster từ `Intl.Segmenter(undefined, { granularity: 'grapheme' })` — đảm bảo hard-cut luôn rơi đúng ranh giới ký tự, nhất quán giữa tiếng Việt/Anh/Nhật/Hàn và cả emoji ghép (ZWJ).
-- **`SrtService`** (`src/main/services/SrtService.ts`, không import Electron — cùng convention `ProjectService`) đọc `max_characters`/`fake_duration_sec` từ chính project (đã snapshot lúc tạo project, mục 6.1), **không** đọc `AppSettings` global hiện hành. `split(projectId)` xoá sạch + insert lại toàn bộ `srt_blocks` của project trong 1 transaction mỗi lần chạy (replace, không diff) — khớp đúng pseudo flow Run All ở mục 36, nơi `createSrtBlocks()` luôn chạy vô điều kiện mỗi lần Run/Resume chứ không qua vòng đời `pending/running/success/failed` như Character Detection/Character Prompt.
+- **`avgCharacters`/`min`/`max` đếm theo ký tự thị giác (grapheme cluster), không phải UTF-16 code unit** của JS (`.length`/`.slice()` mặc định). Lý do: `.length` đếm sai với tiếng Việt nếu văn bản ở dạng NFD (dấu tách rời khỏi chữ cái, hay gặp khi copy từ macOS/PDF — 1 chữ có dấu bị tính thành 2+ code unit). Implementation: `transcript.normalize('NFC')` ngay đầu vào, sau đó mọi phép đếm (ngưỡng gom câu, `character_count` output) đều thao tác trên mảng grapheme cluster từ `Intl.Segmenter(undefined, { granularity: 'grapheme' })`. (Trước 2026-08-11 việc này còn phục vụ cả hard-cut ở 11.3 — không còn hard-cut nữa nên chỉ còn phục vụ đếm ký tự, nhưng vẫn cần thiết vì lý do đếm đúng nói trên.)
+- **`SrtService`** (`src/main/services/SrtService.ts`, không import Electron — cùng convention `ProjectService`) đọc `avg_characters`/`variance_percent`/`fake_duration_sec` từ chính project (đã copy 1 lần từ channel lúc tạo project, mục 6.1/6.5), **không** đọc `AppSettings` global hiện hành. `split(projectId)` xoá sạch + insert lại toàn bộ `srt_blocks` của project trong 1 transaction mỗi lần chạy (replace, không diff) — khớp đúng pseudo flow Run All ở mục 36, nơi `createSrtBlocks()` luôn chạy vô điều kiện mỗi lần Run/Resume chứ không qua vòng đời `pending/running/success/failed` như Character Detection/Character Prompt.
 - Chưa tạo `pipeline_tasks` row riêng cho `SPLIT_SRT` ở Phase 5 — quyết định thuộc `TaskQueueService`/`PipelineService` khi Phase 9 wire Run All thật.
+- **Phase 19 bug fix:** bản đầu của "ưu tiên đạt `min` trước khi ngắt" (11.2) dùng điều kiện `currentBlock.length < min` không kèm guard — ở `variancePercent = 0` thì `min === max`, khiến điều kiện gần như luôn đúng và ép toàn bộ transcript gộp vào 1 block, phá vỡ cam kết "variance 0 = y hệt thuật toán cũ". Fix: chỉ áp dụng nhánh "ưu tiên đạt min" khi `min < max` (tức `variancePercent > 0`) — xem `context/schema.md` Changelog Phase 19.
 
 ---
 
@@ -917,7 +1054,7 @@ Không gọi LLM.
 
 Input:
 - transcript
-- maxCharacters
+- avgCharacters / variancePercent (đổi tên từ maxCharacters + thêm variancePercent, Phase 19)
 - fakeDuration
 
 Output:
@@ -1126,6 +1263,8 @@ Không gửi toàn bộ transcript vào Scene Generation.
 
 `ScenePromptService` (`src/main/services/ScenePromptService.ts`) chạy local matching trước cho từng SRT; nếu rỗng mới fallback gọi selector LLM (retry tới `project.maxRetry`); nếu selector vẫn lỗi hết retry, fallback tiếp theo mục 31 (compact index toàn bộ nhân vật, không có Character Reference). Chi tiết orchestration đầy đủ (bao gồm cách gộp kết quả relevant selection của nhiều SRT khi đã batch — mục 17) xem mục 17's ghi chú implementation.
 
+**Cập nhật thật (2026-08-10):** local matching giờ có thêm 1 pre-pass (`resolveLocalRelevantCharacterIds`) chạy trước toàn bộ pipeline selection — pronoun carry-forward, và selector LLM call (khi cần) giờ batch theo Scene Generation batch thay vì per-SRT. Chi tiết đầy đủ xem "Cập nhật thật (2026-08-10)" ở mục 31.
+
 ---
 
 # 17. Step 5 — Scene Prompt Generation
@@ -1137,6 +1276,8 @@ CHÍNH XÁC 1 IMAGE PROMPT
 ```
 
 **Batch nhiều SRT / request (cập nhật Phase 8, sau khi V1 chạy chậm với 1 SRT/request):** để giảm số lần gọi LLM, nhiều SRT liên tiếp được gộp vào 1 request thay vì gọi riêng từng SRT — mặc định **10 SRT/batch** (hằng số `SCENE_PROMPT_BATCH_SIZE`, không phải setting DB/UI; hạ từ 20 xuống 10 ngày 2026-08-09 theo yêu cầu user — batch 20 chạy cảm giác lâu). Mỗi SRT trong batch vẫn tạo đúng 1 image prompt — batch chỉ gộp request, không gộp output.
+
+**Cập nhật thật (Phase 17, 2026-08-10 — theo yêu cầu user, thêm setting chỉnh batch size):** con số này giờ **là setting DB/UI** — field mới `projects.scene_batch_size` (integer, default 10, range 1–20, xem `context/schema.md` Changelog Phase 17), chỉnh được qua Settings > Advanced > Pipeline Tuning cùng chỗ với Scene Generation Concurrency (mục 33). `SCENE_PROMPT_BATCH_SIZE` (`generateScenePrompt.ts`) vẫn tồn tại nhưng chỉ còn là giá trị mặc định fallback của `chunkSrtBlocks()` khi không truyền `batchSize` — `ScenePromptService.generate()` (app thật) luôn truyền `project.sceneBatchSize` tường minh. Range 1–20 (trần trùng đúng batch 20 đã bị hạ xuống 10 ở trên vì chạy chậm) là quyết định có chủ đích, hỏi lại user trước khi implement theo CLAUDE.md (đây là thay đổi schema — thêm cột).
 
 Mỗi scene request gửi:
 
@@ -1158,7 +1299,7 @@ Batch atomic (cùng nguyên tắc mục 15/18.2 cho Character Generation): nếu
 ## 17.1. Implementation thật (Phase 8)
 
 `src/main/pipeline/generateScenePrompt.ts` (pure function, không import Electron/DB — unit-test qua `tests/unit/generateScenePrompt.test.ts`):
-- `chunkSrtBlocks(blocks, batchSize = SCENE_PROMPT_BATCH_SIZE)` — `SCENE_PROMPT_BATCH_SIZE = 10` (2026-08-09; 20 ban đầu).
+- `chunkSrtBlocks(blocks, batchSize = SCENE_PROMPT_BATCH_SIZE)` — `SCENE_PROMPT_BATCH_SIZE = 10` là fallback default của hàm thuần này (2026-08-09; 20 ban đầu); app thật gọi với `batchSize = project.sceneBatchSize` (per-project, Phase 17, 2026-08-10 — xem đầu mục 17).
 - `buildBatchSrtText()` build `{{SRT_TEXT}}`: mỗi SRT trong batch thành `BLOCK <n>:\n<text>`, cách nhau dòng trống, kèm `Previous SRT: ...`/`Next SRT: ...` (1 block liền kề batch, không phải liền kề từng SRT) khi có.
 - `buildRelevantCharactersSection()`/`buildRelevantCharacterPromptsSection()` build data đầy đủ (Visual DNA nguyên văn, không cắt như compact index) cho hợp (union) Character ID liên quan trên toàn batch.
 - `assembleSceneContext()` — token estimation (`text.length`, mục 18.4) + trim theo priority khi vượt ngân sách; ngân sách scale theo batch size (xem mục 18.4).
@@ -1282,6 +1423,8 @@ Không restart toàn pipeline vì một Scene lỗi.
 
 **Implementation thật (Phase 9):** Character Detection (1 lần gọi/attempt) và Character Prompt Generation (atomic theo batch) đã retry đúng `project.maxRetry` từ Phase 6-7, không đổi. Scene Generation (Phase 8/9) cũng atomic theo batch nhưng **có thêm điểm dừng giữa mỗi lần retry** để Pause/Cancel không phải đợi hết cả `maxRetry` lần gọi thật mới có tác dụng (phát sinh sau khi test với model thật — project ít SRT chỉ có 1 batch, không có điểm dừng "giữa các batch" nào để chạm tới) — xem mục 33/37. Cùng lỗ hổng này **chưa** được vá cho Character Detection/Character Prompt Generation (ghi nhận là giới hạn đã biết trong `context/plan.md` Phase 9, chưa xử lý).
 
+**Cập nhật thật (Phase 16, 2026-08-10):** `3 attempts` ở trên không còn là default thật — `DEFAULT_MAX_RETRY` hạ xuống `1` (không còn UI để chỉnh, chi tiết đầy đủ xem mục 10.3). Cơ chế retry-per-task mô tả ở đoạn trên (mỗi task tự retry tới `project.maxRetry`, không restart cả pipeline vì 1 Scene lỗi) không đổi — chỉ đổi con số ngân sách mặc định, với `maxRetry = 1` thì "retry" thực chất chỉ còn đúng 1 lần thử, không có lần thử lại thật sự nào nữa trừ khi user/test tự nâng qua `updatePipelineSettings()`.
+
 ## 19.2. Save after success
 
 Ví dụ:
@@ -1315,6 +1458,8 @@ Không chạy lại success task trừ khi user chọn Regenerate.
 
 **Implementation thật (Phase 9):** không có nút Resume riêng biệt về code — `pipeline.resume()`/`pipeline.run()`/`pipeline.retryTask()` (mục 4.2) đều gọi cùng 1 hàm `PipelineService.runProject()` (mục 36). Mỗi bước trong đó tự kiểm tra "đã xong chưa" trước khi chạy (`if (srtBlocks.length === 0)`, `if (characters.length === 0)`, `if (!characterPromptsDone)`, Scene Generation tự bỏ qua batch đã xong ở trong chính nó) — nên gọi lại hàm này trên 1 project đã chạy dở LUÔN LÀ Resume đúng nghĩa, không cần code path/nút bấm riêng để phân biệt "Run lần đầu" và "Resume". TopBar/Processing tab chỉ đổi **nhãn** nút hiển thị theo `projects.status` (mục 7/8.6), gọi cùng 1 IPC.
 
+**Cập nhật (Phase 15, ngoài phạm vi V1 gốc):** cơ chế gating mô tả ở trên **không đổi gì cả** — `runProject()` vẫn resume đúng nghĩa nếu được gọi. Cái mất đi chỉ là **đường vào UI cho đúng 1 trường hợp**: `status=paused` không còn nút nào gọi `pipeline.run()`/`resume()` nữa (mục 7/8.6). `pipeline.resume()` (IPC, mục 4.2) vẫn còn nguyên, không bị xoá — chỉ không còn ai gọi tới khi `status=paused`. Case `failed`/`completed_with_errors` (Retry Failed) và mọi run kích hoạt qua Run Queue (mục 6.4) không bị ảnh hưởng, vẫn dùng đúng cơ chế Resume này.
+
 ---
 
 # 20. Regenerate
@@ -1340,6 +1485,8 @@ Cancel
 
 **Implementation thật (Phase 12):** cả 3 mục ở trên được cover bằng 2 cơ chế khác nhau tuỳ mức độ ảnh hưởng. "Regenerate Character Detection" (thay toàn bộ Character Database, ảnh hưởng dây chuyền tới Scene Prompt) mới thật sự cần dialog xác nhận — implement đúng 3 lựa chọn (`CharactersPage.tsx`'s `RegenerateCharactersModal`, dùng lại `components/ui/Modal.tsx` từ Phase 2). "Regenerate Character Prompt"/"Regenerate Scene Prompt" (regenerate đúng 1 đơn vị, không ảnh hưởng gì khác) đã có sẵn từ Phase 7/8 dưới dạng nút **Retry** trên từng card lỗi (`characters.retryPrompt`/`scenePrompts.retry`) — không cần dialog riêng vì đã là hành động 1-click rõ ràng, không có gì mơ hồ cần xác nhận. Nút "Detect Characters" ở Characters tab tự đổi thành **"Regenerate"** (icon đổi theo) một khi project đã có character — bấm mở dialog; lần đầu tiên (chưa có character nào) vẫn chạy ngay không cần dialog vì không có gì để mất. IPC `characters.detect(projectId, options?: { clearScenePrompts?: boolean })` (mở rộng signature Phase 6, không phải channel mới) — chọn "characters only" giữ nguyên `scene_prompts`; chọn "characters + all scene prompts" xoá sạch `scene_prompts` (`ScenePromptService.clearAll()`) sau khi detect xong. Cảnh báo "Character Database thay đổi có thể làm Scene Prompt cũ không đồng nhất" chỉ hiện trong dialog khi project đang có Image Prompts (`scenePrompts.list().length > 0`). **Bug fix phát hiện khi làm phase này:** `character_prompts` không có FK tới `characters` (business-key relation qua `character_id`), nên regenerate trước đó chỉ thay `characters` để lại row `character_prompts` cũ mồ côi vĩnh viễn trong DB thật (chỉ bị xoá ở local state UI) — `CharacterService.detect()` giờ luôn xoá `character_prompts` cùng transaction khi thay `characters`.
 
+**Cập nhật (Phase 14, ngoài phạm vi V1 gốc):** "Regenerate Character Detection" **không còn cách nào trigger từ UI nữa** — nút "Detect Characters"/"Regenerate" cùng `RegenerateCharactersModal` bị xoá hẳn khỏi `CharactersPage.tsx` (mục 8.4). "Regenerate Character Prompt"/"Regenerate Scene Prompt" (2 nút **Retry** đơn vị) không đổi gì, vẫn hoạt động bình thường. `characters.detect(projectId, options?)` (IPC) vẫn còn nguyên ở Main với đầy đủ khả năng `clearScenePrompts`, chỉ không còn UI nào gọi tới.
+
 ---
 
 # 21. Export
@@ -1347,17 +1494,39 @@ Cancel
 Output folder:
 
 ```text
-Project_Name/
-├── Project_Name.srt
-├── character_prompts.txt
-└── image_prompts.txt
+Channel_Name/
+└── Project_Name/
+    ├── Project_Name.srt
+    ├── character_prompts.txt
+    ├── image_prompts.txt
+    └── character_list.txt   (chỉ khi project có nhân vật — Phase 24)
 ```
+
+**Cập nhật (Phase 24, ngoài phạm vi V1 gốc, theo yêu cầu trực tiếp user):** thêm file thứ 4 `character_list.txt` — danh sách Character ID (bỏ tiền tố `@`), mỗi dòng 1 nhân vật, không cách dòng trống giữa các dòng:
+
+```text
+Qin_Hong_Adult
+Xue_Ge
+Lin_San
+```
+
+Liệt kê **toàn bộ** nhân vật trong Character Database (không lọc theo prompt có thành công hay không, khác `character_prompts.txt`) — đây là danh sách tên, không phải file output dùng được. Chỉ ghi file này khi project có ít nhất 1 nhân vật (`characters.length > 0`) — project thuộc channel "No Characters" (mục 6.5) không có gì để liệt kê nên không tạo file rỗng, khác `character_prompts.txt`/`image_prompts.txt` vốn luôn ghi (kể cả rỗng). `formatCharacterListFile()` (`src/shared/exportFormat.ts`) là nguồn format duy nhất, dùng chung cho `ExportService.export()` và Export tab preview.
+
+**Cập nhật thật (Phase 20 — Post-V1, ngoài phạm vi V1 gốc, 2026-08-11, theo yêu cầu trực tiếp user):** thêm 1 lớp thư mục `Channel_Name/` bên ngoài `Project_Name/` — project thuộc channel nào thì export vào đúng thư mục con của channel đó bên trong Default Export Folder (mục 10, Settings > General, vẫn global, không đổi). Không phải schema change (không đọc/ghi field DB mới, chỉ đọc `channels.name` đã có sẵn qua `project.channelId`). Chi tiết: `context/schema.md` Changelog Phase 20.
 
 Không tách mỗi SRT thành file riêng.
 
 Không tách mỗi prompt thành file riêng.
 
-**Implementation thật (Phase 11):** thư mục cha (nơi tạo `Project_Name/`) do user chọn qua native folder picker (`dialog.showOpenDialog`, `openDirectory` + `createDirectory`) mỗi lần bấm Export — không cố định, `defaultPath` gợi ý bằng `AppSettings.lastExportFolder` (lần export gần nhất) hoặc thư mục Documents nếu chưa từng export. `Project_Name` lấy tên thật của project, chỉ thay các ký tự không hợp lệ trên đường dẫn macOS/Windows (`/ \ : * ? " < > |`) thành `_` (`sanitizeProjectFolderName()`, `src/shared/exportFormat.ts`) — giữ nguyên khoảng trắng/unicode.
+**Implementation thật (Phase 11):** thư mục cha (nơi tạo `Project_Name/`) do user chọn qua native folder picker (`dialog.showOpenDialog`, `openDirectory` + `createDirectory`) mỗi lần bấm Export — không cố định, `defaultPath` gợi ý bằng `AppSettings.lastExportFolder` (lần export gần nhất) hoặc thư mục Documents nếu chưa từng export. `Project_Name` lấy tên thật của project, chỉ thay các ký tự không hợp lệ trên đường dẫn macOS/Windows (`/ \ : * ? " < > |`) thành `_` (`sanitizeFolderName()`, `src/shared/exportFormat.ts` — đổi tên từ `sanitizeProjectFolderName()` ở Phase 20 vì giờ dùng chung cho cả tên channel lẫn tên project) — giữ nguyên khoảng trắng/unicode.
+
+**Implementation thật (Phase 20):** `ExportService.resolveFolderNames()` (private helper, dùng chung bởi `resolveFolderPath()`/`export()`) đọc `project.channelId` → `findChannelById()` lấy tên channel **hiện hành** (không snapshot — giống `Project_Name` cũng luôn là tên hiện hành, không snapshot) — đổi tên channel sau đó sẽ đổi luôn thư mục xuất ra ở lần Run kế tiếp. `ExportPage.tsx` (preview) gọi thêm `channels.get(currentProject.channelId)` để hiện đúng `Channel_Name/Project_Name/` trong card "Output Folder", khớp 100% với đường dẫn thật `ExportService` ghi ra (cùng nguồn `sanitizeFolderName()`).
+
+**Cập nhật lớn (Phase 14, ngoài phạm vi V1 gốc) — thay thế toàn bộ cách chọn thư mục cha ở trên:**
+- **`AppSettings.lastExportFolder` đổi vai trò** từ "gợi ý `defaultPath` cho dialog, hỏi lại mỗi lần" thành **"Default Export Folder"** — cấu hình **đúng 1 lần** ở Settings > General (card "Export", nút **Browse…** mở `settings:chooseExportFolder`, IPC mới), dùng lại cho **mọi lần export sau đó, không hỏi dialog nữa**. Field/type trong `AppSettings` (schema.md) giữ nguyên `string | null` — không phải schema change, chỉ đổi ý nghĩa sử dụng.
+- **Dialog chỉ còn xuất hiện đúng 1 lần duy nhất** — lần export tự động đầu tiên (mục 8.7/36) trước khi Default Export Folder từng được cấu hình. Vì lần export này chạy **tự động, không có tương tác người dùng** (bên trong `PipelineService.runProject()`, có thể do Run Queue kích hoạt lúc không ai ngồi trước máy — mục 6.4), **không thể** mở dialog thật sự — thay vào đó tự động fallback về thư mục Documents và lưu lại làm default luôn (`resolvePipelineRuntime()`, `src/main/pipelineRuntime.ts`, dùng chung giữa `pipeline.ipc.ts` và `queue.ipc.ts`). Dialog thật (native folder picker) chỉ còn dùng ở Settings > General's nút Browse — do người dùng chủ động bấm.
+- **Trigger ghi file đổi hẳn** — không còn "mỗi lần bấm Export" nữa (nút đó đã bị xoá, mục 8.7), mà tự động ngay khi Run All đạt `completed`/`completed_with_errors` (mục 36), gọi thẳng `ExportService.export()` từ `PipelineService`, không qua IPC nào cả (Main gọi Main).
+- `Project_Name` sanitize giữ nguyên logic cũ, không đổi.
 
 ---
 
@@ -1402,25 +1571,29 @@ Mỗi nhân vật:
 - Character ID
 - một prompt hoàn chỉnh
 
+**Cập nhật (Phase 23, ngoài phạm vi V1 gốc):** đổi từ "CHARACTER 00N — @CharacterId" xuống dòng, cách 1 dòng trống rồi mới tới prompt, cách nhau 2 dòng trống giữa các nhân vật (bản gốc ở trên) — qua 2 lần chỉnh theo yêu cầu trực tiếp của user (lần đầu thử `PROMPT 00N - @CharacterId: <prompt>` kiểu inline như `image_prompts.txt` Phase 15, sau đó bỏ hẳn phần đánh số `PROMPT 00N -`) — chốt lại thành: mỗi nhân vật 1 dòng/đoạn dạng `@CharacterId: <prompt>` (không đánh số), chỉ 1 dòng trống giữa các nhân vật, nội dung prompt không được chứa dấu xuống dòng. `formatCharacterPromptsFile()` (`src/shared/exportFormat.ts`) tự chuẩn hoá xuống dòng thành khoảng trắng (`normalizePromptText()`, cùng rule `generateScenePrompt.ts` đã dùng cho scene prompts) để cả prompt cũ lỡ có xuống dòng trong DB cũng export đúng 1 dòng — không cần migration DB.
+
+```text
+@Qin_Hong_Adult: Character design of @Qin_Hong_Adult, ...
+
+@Xue_Ge: Character design of @Xue_Ge, ...
+
+@Lin_San: Character design of @Lin_San, ...
+```
+
 ---
 
 # 24. Format image_prompts.txt
 
 ```text
-PROMPT 001:
+PROMPT 001: Comic page layout, ...
 
-Comic page layout, ...
+PROMPT 002: Comic page layout, ...
 
-
-PROMPT 002:
-
-Comic page layout, ...
-
-
-PROMPT 003:
-
-Comic page layout, ...
+PROMPT 003: Comic page layout, ...
 ```
+
+**Cập nhật (Phase 15, ngoài phạm vi V1 gốc):** đổi từ "PROMPT 00N:" xuống dòng, cách 1 dòng trống rồi mới tới prompt, cách nhau 2 dòng trống giữa các prompt (bản gốc ở trên đã sửa lại đúng thực tế) — sang: header và prompt liền 1 dòng/đoạn (`PROMPT 00N: <prompt>`), chỉ 1 dòng trống giữa các prompt. Theo yêu cầu trực tiếp của user, gọn hơn khi đọc file text thô. `formatImagePromptsFile()` (`src/shared/exportFormat.ts`) là nguồn format duy nhất, dùng chung cho cả `ExportService.export()` (ghi file thật) và Export tab preview (Renderer) — không có 2 nơi định dạng khác nhau.
 
 Số prompt phải map 1:1 với SRT index.
 
@@ -1618,6 +1791,8 @@ Nếu placeholder bắt buộc bị xóa khỏi prompt settings:
 
 # 28. DEFAULT PROMPT — CHARACTER DETECTION
 
+> **Phase 28 (plan.md):** các prompt mặc định mục 28–30 trong code (`src/shared/prompts.ts`) đã được **sắp lại thứ tự** — toàn bộ hướng dẫn/quy tắc/OUTPUT cố định đứng trước, các khối dữ liệu thay đổi theo từng request (`{{TRANSCRIPT}}`, `{{CHARACTERS}}`, `{{RELEVANT_CHARACTERS}}`, `{{RELEVANT_CHARACTER_PROMPTS}}`, `{{BLOCK_NUMBER}}`, `{{SRT_TEXT}}`) dồn xuống cuối, để tận dụng prompt caching của DeepSeek/Gemini. Nội dung quy tắc giữ nguyên; chỉ đổi thứ tự và vài câu dẫn ("ở cuối prompt"). Bản trước Phase 28 được giữ nguyên văn ở `src/shared/legacyPrompts.ts`; migration `0009_reorder_default_prompts` đổi channel còn dùng nguyên bản cũ sang bản mới. Văn bản bên dưới là bản gốc tham khảo, `src/shared/prompts.ts` là nguồn chuẩn.
+
 Prompt dưới đây là mặc định trong:
 
 ```text
@@ -1789,9 +1964,9 @@ Với mỗi SRT, tự xác định đại từ, nhân vật xuất hiện, trạ
 
 QUY TẮC (áp dụng cho từng prompt riêng lẻ):
 
-1. Tạo một trang Chinese Manhua/Webtoon khoảng 2–6 panels tùy nội dung. Chọn bố cục phù hợp như diagonal split, stacked panels, asymmetrical layout, overlapping frames, inset close-up hoặc cinematic wide panels.
+1. Tạo một trang Chinese Manhua/Webtoon khoảng 2–6 panels tùy nội dung. Chọn bố cục phù hợp như diagonal split, stacked panels, asymmetrical layout, overlapping frames, inset close-up hoặc cinematic wide panels. Mỗi panel luôn viết theo đúng format "Panel N (vị trí, kích thước):" — N đánh số thứ tự từ 1, vị trí ví dụ top-left/bottom-right/center, kích thước ví dụ small/large/wide. Không dùng label chỉ tả nội dung/kích thước mà thiếu số thứ tự như "BOTTOM PANEL:", "LARGE PANEL:", "INSET PANEL:".
 
-2. Mỗi lần nhân vật xuất hiện phải kèm các đặc điểm Visual DNA quan trọng. Các thay đổi tạm thời được thêm sau Visual DNA nhưng không được thay đổi nhận diện gốc.
+2. Mỗi lần nhân vật xuất hiện, viết đúng theo format `@Character_ID [2-4 đặc điểm Visual DNA quan trọng nhất, phân tách bằng dấu phẩy]` — luôn dùng nguyên văn Character ID (bắt đầu bằng @, giữ nguyên dấu gạch dưới, không viết lại thành tên thường có khoảng trắng, không bỏ dấu @). Không được nhắc một nhân vật mà không kèm ngoặc vuông Visual DNA ngay sau đó, kể cả khi nhân vật đó đã xuất hiện ở panel trước. Các thay đổi tạm thời (biểu cảm, trạng thái, trang phục tạm thời...) được thêm sau Visual DNA gốc trong cùng ngoặc vuông đó nhưng không được thay đổi nhận diện gốc.
 
 3. Nếu một panel có nhiều nhân vật, tách rõ vị trí bằng Left side, Right side, Foreground, Background, Center... để tránh trộn nhân vật.
 
@@ -1809,6 +1984,10 @@ Premium Chinese Manhua style, vibrant webtoon aesthetic, stylized painterly 2D i
 
 Thay [Scene Color Tone] bằng tông màu phù hợp với từng cảnh.
 
+9. Mỗi prompt chỉ gồm đúng phần mô tả panel theo cấu trúc ở trên và dòng style/negative-prompt ở rule 8 — không thêm bất kỳ đoạn tóm tắt, nhận xét, "Overall mood", ghi chú ý nghĩa hay bình luận nào khác ngoài 2 phần đó.
+
+10. Toàn bộ nội dung 1 prompt (mọi panel gộp với dòng style ở rule 8) phải nằm trên đúng 1 dòng duy nhất — giá trị "prompt" trong JSON không được chứa ký tự xuống dòng. Nối các panel liền nhau bằng dấu chấm và khoảng trắng (". "), không xuống dòng riêng giữa các panel.
+
 OUTPUT:
 Chỉ trả về JSON hợp lệ theo cấu trúc:
 
@@ -1825,6 +2004,12 @@ Mảng "scene_prompts" phải có đúng 1 phần tử cho MỖI số block có 
 
 Không gộp nhiều SRT vào 1 prompt. Không bỏ sót SRT nào. Không giải thích. Không xuất dữ liệu trung gian. Luôn giữ Character ID và Visual DNA nhất quán.
 ```
+
+**Cập nhật (Phase 15, ngoài phạm vi V1 gốc) — rule 2 siết chặt + rule 9 mới:** phát hiện qua export thật — cùng 1 prompt template nhưng các batch khác nhau (mỗi batch là 1 lời gọi LLM độc lập) tự diễn giải khác nhau: có batch nhắc nhân vật bằng đúng `@Character_ID [Visual DNA]`, có batch chỉ viết tên thường không dấu `@` và không kèm đặc điểm gì (ví dụ "Hua An Ran" thay vì `@Hua_An_Ran [...]`); có batch tự thêm đoạn "Overall mood: ..." không được yêu cầu, có batch thì không. Nguyên nhân: rule 2 gốc dùng ngôn ngữ mô tả ("phải kèm... quan trọng") thay vì 1 format bắt buộc rõ ràng, nên rơi vào tay model là mỗi lần diễn giải 1 kiểu. Sửa: rule 2 quy định cứng format `@Character_ID [...]`, cấm viết tên thường; thêm rule 9 cấm nội dung ngoài cấu trúc đã định nghĩa. Không đổi field/placeholder nào, không phải bug code — người dùng cũ vẫn cần vào Settings > Prompts > Scene / Image Generation bấm "Reset to Default" thủ công nếu muốn nhận bản rule mới (prompt hiện tại của project đã snapshot ở lần Run đầu, mục 32, không tự động cập nhật).
+
+**Cập nhật (Phase 15, tiếp) — rule 1 thêm quy định label panel:** cùng nguyên nhân/cơ chế như trên, phát hiện thêm 1 điểm không nhất quán khác từ export thật — có batch đánh số "Panel 1 (top-left, small):", có batch dùng label tả nội dung không đánh số như "BOTTOM PANEL:"/"LARGE PANEL:"/"INSET PANEL:". Rule 1 gốc chỉ nói "chọn bố cục phù hợp" mà không quy định cách đặt tên/đánh số panel trong text. Sửa: rule 1 thêm câu bắt buộc format "Panel N (vị trí, kích thước):", cấm label chỉ tả nội dung thiếu số thứ tự. Cùng lưu ý snapshot như trên — project cũ cần Reset to Default thủ công.
+
+**Cập nhật (Phase 15, tiếp) — rule 10 mới + lưới an toàn ở code:** phát hiện thêm — 1 prompt có thể chứa ký tự xuống dòng thật giữa các panel (ví dụ "Panel 1 (...):...\n\nPanel 2 (...):...") thay vì nằm trên 1 dòng liền, dù JSON đã ép cấu trúc. Thêm rule 10 quy định toàn bộ 1 prompt (mọi panel + dòng style rule 8) phải nằm đúng 1 dòng, nối bằng ". " thay vì xuống dòng. Khác với rule 2/9 (chỉ dựa vào model tuân thủ), lần này còn thêm **lưới an toàn ở tầng code**: `normalizePromptText()` (`src/main/pipeline/generateScenePrompt.ts`, dùng trong `parseSceneGenerationResponse()`) tự động thay mọi `\n` bằng khoảng trắng rồi gộp khoảng trắng thừa — đảm bảo prompt lưu vào DB luôn đúng 1 dòng **bất kể model có tuân thủ rule 10 hay không**, không chỉ dựa vào wording của prompt như 2 lần sửa trước. Áp dụng cho cả `generate()` lẫn `retry()` (dùng chung parser). Không áp dụng cho Character Prompt Generation (`generateCharacterPrompts.ts` có cùng pattern trích `prompt` nhưng chưa được yêu cầu chuẩn hoá).
 
 **Cập nhật thật (2026-08-09, sau khi phát hiện lỗi thật với model qua Vilao):** OUTPUT đổi từ plain text (`"PROMPT <n>:\n[prompt]"`) sang JSON (`{ "scene_prompts": [{ "block_number", "prompt" }] }`) — đồng bộ với 3/4 bước gọi LLM còn lại trong app (Character Detection, Character Prompt Generation, Internal Relevant Character Selector đều đã dùng JSON + `repairJsonText()` từ trước; Scene Generation trước đó là ngoại lệ duy nhất dùng plain text, lý do ban đầu là tiết kiệm token — xem đoạn mở đầu mục này). Lần sửa đầu tiên (cùng ngày) chỉ thử viết rõ hơn phần OUTPUT plain text (thêm ví dụ + cảnh báo "BẮT BUỘC") nhưng không đủ triệt để; đổi hẳn sang JSON là bước tiếp theo, dựa trên nhận định JSON là cấu trúc model được huấn luyện tuân thủ tốt hơn nhiều so với marker text tự quy ước, và tận dụng lại được `repairJsonText()`/parser pattern đã chứng minh ổn định ở 3 bước kia. Cơ chế tự chia nhỏ batch khi response vẫn không hợp lệ (`SceneFormatCollapseError`, `ScenePromptService.generateBatch` — xem plan.md Phase 8 addendum) **vẫn giữ nguyên** làm lưới an toàn cuối cùng, không phụ thuộc JSON hay text.
 
@@ -1853,7 +2038,13 @@ Nếu selector lỗi:
 - retry.
 - nếu vẫn lỗi, fallback inject compact index và không inject full Character Reference cho tất cả nhân vật.
 
-**Implementation thật (Phase 8):** nguyên văn prompt trên đặt trong `src/main/pipeline/selectRelevantCharacters.ts` (hằng số nội bộ, không export ra ngoài) — **không** đặt trong `src/shared/prompts.ts` cùng 3 default prompt kia, đúng nghĩa đen "không cần hiển thị trong Prompt Settings V1" (mục 26 chỉ có 3 tab Character Detection/Generation/Scene). `buildRelevantCharacterSelectorMessages(srtWithNeighborContext, compactCharacterIndex)` thay 2 placeholder rồi trả 1 `LlmChatMessage` role `user`. `parseRelevantCharacterSelectorResponse(content, validCharacterIds)` parse + repair JSON (dùng chung `repairJsonText()` với các bước khác) — Character ID lạ (không nằm trong `validCharacterIds`) bị lọc bỏ âm thầm thay vì làm hỏng cả response (đây là logic hệ thống nội bộ, không phải output cuối cho user), chỉ throw khi JSON không parse được (trigger retry). `ScenePromptService` chạy retry loop riêng cho selector (tách biệt retry loop của chính Scene Generation) tới `project.maxRetry` lần trước khi rơi vào fallback ở trên.
+**Implementation thật (Phase 8):** nguyên văn prompt trên đặt trong `src/main/pipeline/selectRelevantCharacters.ts` (hằng số nội bộ, không export ra ngoài) — **không** đặt trong `src/shared/prompts.ts` cùng 3 default prompt kia, đúng nghĩa đen "không cần hiển thị trong Prompt Settings V1" (mục 26 chỉ có 3 tab Character Detection/Generation/Scene). `parseRelevantCharacterSelectorResponse(content, validCharacterIds)` parse + repair JSON (dùng chung `repairJsonText()` với các bước khác) — Character ID lạ (không nằm trong `validCharacterIds`) bị lọc bỏ âm thầm thay vì làm hỏng cả response (đây là logic hệ thống nội bộ, không phải output cuối cho user), chỉ throw khi JSON không parse được (trigger retry). `ScenePromptService` chạy retry loop riêng cho selector (tách biệt retry loop của chính Scene Generation) tới `project.maxRetry` lần trước khi rơi vào fallback ở trên.
+
+**Cập nhật thật (2026-08-10) — batch hoá selector call + local pronoun carry-forward:** phát hiện qua phân tích cost/latency — với project vài trăm/nghìn SRT block, selector chạy per-SRT (1 request/block khi local match trượt) là nguồn tốn token/thời gian chính, nhiều hơn hẳn Scene Generation (đã batch 10 block/request từ đầu, mục 17). Hai thay đổi cộng dồn:
+1. **Batch selector call theo đúng batch của Scene Generation** — 1 request chứa mọi SRT trong batch còn cần selector (thay vì 1 request/block). `buildRelevantCharacterSelectorMessages`/`parseRelevantCharacterSelectorResponse` (single-item) bị thay bằng `buildBatchRelevantCharacterSelectorMessages(items, compactCharacterIndex)`/`parseBatchRelevantCharacterSelectorResponse(content, blockNumbers, validCharacterIds)` — cùng dạng response "keyed theo block_number" mà `parseSceneGenerationResponse` (mục 17) đã dùng: `{"relevant_characters":[{"block_number":1,"character_ids":["@ID_1"]}]}`. Khác 1 điểm so với Scene Generation: parse lenient — 1 block thiếu trong response chỉ nhận `[]` (coi như selector không tìm thấy gì), **không** throw/retry cả batch; chỉ throw khi JSON không parse được hoặc sai shape ở cấp cao nhất. Hệ quả chấp nhận được: nếu selector thật sự lỗi hết `maxRetry` lần, cả nhóm block cần selector trong batch đó cùng rơi vào fallback mục 31 (thay vì độc lập từng block như trước) — hiếm gặp vì đúng JSON contract đã ổn định ở 3 bước LLM khác.
+2. **Local pronoun carry-forward** (`resolveLocalRelevantCharacterIds(blocks, characters)`, `selectRelevantCharacters.ts`) — chạy 1 lần, tuần tự, trên toàn bộ danh sách block (thuần string, không LLM) trước khi batch/concurrency bắt đầu: nếu 1 block khớp tên trực tiếp (`matchLocalRelevantCharacterIds`), tập nhân vật đó được nhớ làm "last known"; block sau đó không khớp tên trực tiếp nhưng có đại từ ngôi 3 (`containsPronounHint` — danh sách ngắn song ngữ VI/EN: hắn/họ/gã/nó, "cô ấy"/"anh ta"/"anh ấy"/"chị ấy"/"ông ấy"/"bà ấy"/"người đó"; he/she/him/her/his/hers/they/them/their/it) thì kế thừa "last known" thay vì phải gọi selector. Đây là heuristic, không chắc chắn 100% — 1 cảnh đổi nhân vật hoàn toàn im lặng (không tên mới, không đại từ) vẫn có thể kế thừa nhầm nhân vật cũ; chấp nhận được vì hậu quả chỉ là dư/sai 1 dòng Visual DNA trong context của 1 Scene Prompt, không làm hỏng cả bước pipeline.
+
+Không đổi field/schema nào (`scene_prompts.relevant_character_ids` vẫn giữ nguyên ý nghĩa). Fallback cuối (mục 31: selector lỗi hết retry → compact index toàn bộ, không Character Reference) không đổi hành vi.
 
 ---
 
@@ -1866,7 +2057,7 @@ character_detection_prompt_snapshot
 character_generation_prompt_snapshot
 scene_generation_prompt_snapshot
 selected_model_snapshot
-max_characters_snapshot
+avg_characters_snapshot (đổi tên từ max_characters_snapshot, Phase 19)
 fake_duration_snapshot
 ```
 
@@ -1892,7 +2083,7 @@ Concurrency = 1
 
 Scene Generation:
 - mặc định 4 concurrent requests (nâng từ 2 ngày 2026-08-09, theo yêu cầu user).
-- Advanced Settings có thể chỉnh 1–5.
+- Advanced Settings có thể chỉnh 1–10 (nới từ 1–5 ngày 2026-10-21, theo yêu cầu user; Scene Generation Batch Size cũng nới 1–20 → 1–30).
 
 Cần tránh gửi hàng chục request đồng thời.
 
@@ -2027,6 +2218,8 @@ async function runProject(projectId: string) {
 
 `onTaskUpdate` (callback tuỳ chọn, đẩy qua IPC `pipeline:progressEvent`, mục 8.6) chỉ bắn cho 3 bước cấp dự án — Scene Generation dùng lại kênh `scenePrompts:progressEvent` đã có từ Phase 8, không tạo kênh mới.
 
+**Cập nhật (Phase 14, ngoài phạm vi V1 gốc):** pseudo flow trên giờ thiếu 1 bước ở cuối — ngay sau `markProjectCompleted()`, `runProject()` gọi thêm `exportService.export(projectId, runtime.exportFolder)` (best-effort, lỗi chỉ log ra console chứ không throw, xem mục 8.7/21). `runProject()` cũng được gọi từ 2 nơi thay vì 1 kể từ Phase 14: trực tiếp qua `pipeline.run`/`resume`/`retryTask` (như cũ), **hoặc** gián tiếp qua `QueueService.drain()` (mục 6.4) khi tới lượt project đó trong Run Queue — cả 2 đường dùng chung đúng 1 `PipelineService` instance (`getPipelineService()`) nên không có khác biệt hành vi nào giữa 2 cách gọi.
+
 ---
 
 # 37. Pause / Cancel
@@ -2048,6 +2241,17 @@ async function runProject(projectId: string) {
 
 Nếu app bị đóng đột ngột (force-quit) giữa lúc `status=processing` (không qua Pause/Cancel đàng hoàng), controller trong bộ nhớ biến mất cùng tiến trình — `ProjectService.open()` tự downgrade `processing` → `paused` khi project được mở lại ở phiên app tiếp theo, để không bị kẹt vĩnh viễn ở "Processing" dù không còn gì đang chạy thật.
 
+**Cập nhật lớn (Phase 14, ngoài phạm vi V1 gốc) — Pause/Cancel UI bị thay bằng Delete-while-running:**
+- **2 nút Pause/Cancel ở TopBar (mục 7) và Processing tab (mục 8.6) bị xoá hẳn**, theo yêu cầu trực tiếp của user — lý do nêu ra: 2 nút này vốn gọi cùng 1 hàm `pause()` bên dưới (đã ghi rõ ở đoạn trên), giữ cả 2 chỉ dư thừa. Thay bằng đúng 1 nút **Delete** khi `status=processing` — xoá được project ngay cả khi đang chạy dở, không có lựa chọn "chỉ tạm dừng, giữ lại data" nữa từ UI (dữ liệu vẫn **không mất** trước khi xoá — chỉ là không còn đường quay lại sau khi đã bấm Delete, đúng bản chất xoá).
+- **IPC `pipeline.pause`/`pipeline.cancel` và hàm `PipelineService.pause()`/`.cancel()` vẫn còn nguyên**, không bị xoá — chỉ không còn UI nào gọi tới nữa. Cơ chế `stopRequested` mô tả ở trên vẫn đúng 100%, chỉ khác **ai** gọi nó.
+- **`PipelineService.stopAndWait(projectId)`** (method mới) là cơ chế thật sự đứng sau nút Delete: gọi request-stop y hệt `pause()`/`cancel()` (bật `stopRequested = true`), **nhưng đợi thật sự** cho tới khi lời gọi `runProject()` đang chạy dở của project đó **settle hẳn** (resolve hoặc reject) mới trả về — khác `pause()`/`cancel()` gốc chỉ bắn cờ rồi return ngay không đợi gì. Bắt buộc phải đợi vì lý do kỹ thuật: `projects.ipc.ts`'s handler xoá row DB **ngay sau khi** `stopAndWait()` xong — nếu không đợi, bước đang chạy dở (ví dụ `upsertPipelineTask`/`upsertCharacterPrompt`) có thể ghi tiếp vào 1 project vừa bị xoá, vi phạm foreign key (`foreign_keys = ON`, schema.md). Track promise đang chạy qua `Map<projectId, Promise<void>>` mới (`runningPromises`) song song với `controllers` map cũ.
+- **Nếu project đang nằm trong Run Queue** (mục 6.4) lúc bị xoá — `queueService.remove(id)` được gọi ngay sau `stopAndWait()`, trước khi xoá DB. Không cần logic riêng để "chuyển sang project kế tiếp" — `QueueService.drain()`'s vòng `while` vốn đã tự nhặt item kế tiếp ngay khi lời gọi `runProject()` hiện tại settle (chính là lúc `stopAndWait()` vừa đợi xong), nên project kế tiếp tự chạy tiếp bình thường.
+- **`DeleteProjectModal`** (component mới, dùng chung Home/TopBar/Processing tab) đổi nội dung cảnh báo khi `isRunning=true`: nói rõ đang dừng 1 run thật sự đang chạy, có thể mất vài giây (đợi bước hiện tại xong) và mất luôn phần đang xử lý dở.
+
+**Cập nhật (Phase 15, ngoài phạm vi V1 gốc) — Delete không còn chờ `stopAndWait()` ở UI:** bấm Delete trong `DeleteProjectModal` giờ đóng modal **ngay lập tức** và gọi `appApi.projects.delete()` **không await** (fire-and-forget, lỗi chỉ log console) — thay vì trước đây (`isDeleting` state, nhãn "Deleting…") chờ cả `stopAndWait()` xong (có thể mất vài giây nếu đang giữa 1 network call) mới đóng modal. Lý do: theo yêu cầu user — không muốn đợi. Cơ chế backend (`stopAndWait()` rồi mới xoá DB, tránh vi phạm FK) **không đổi gì** — chỉ UI không còn block chờ nó nữa. Hệ quả: `ProjectsListPage.tsx`/`QueuePage.tsx` phải tự ẩn project vừa xoá khỏi danh sách ngay (local `deletedIds` set, optimistic) thay vì gọi lại `refresh()` — vì gọi lại ngay lúc đó vẫn sẽ thấy project chưa thật sự bị xoá ở DB (đang giữa `stopAndWait()`), làm nó "sống lại" trên UI.
+
+**Cập nhật (Phase 15) — hệ quả từ việc xoá nút Resume (mục 7):** 1 project bị `paused` do force-quit rồi mở lại (đoạn trên) giờ **không còn cách nào chạy tiếp được từ UI** — trước Phase 15 vẫn bấm Resume được ở TopBar/Processing tab, giờ chỉ còn badge tĩnh "Paused". Dữ liệu vẫn nguyên vẹn, không mất — chỉ là không có nút nào gọi lại `runProject()` cho case này nữa.
+
 ---
 
 # 38. Validation trước Run
@@ -2058,7 +2262,7 @@ Không cho Run nếu:
 - API key chưa được cấu hình.
 - API key chưa hợp lệ.
 - Chưa chọn model.
-- `maxCharacters` không hợp lệ.
+- `avgCharacters` không hợp lệ (đổi tên từ `maxCharacters`, Phase 19).
 - prompt bắt buộc bị rỗng.
 - placeholder bắt buộc bị thiếu.
 
@@ -2069,7 +2273,7 @@ Scene Prompt thiếu {{SRT_TEXT}}.
 Vui lòng sửa Prompt Settings trước khi chạy.
 ```
 
-**Implementation thật (Phase 9):** `validateProjectForRun()` (`src/shared/validateRun.ts` — không đặt ở `src/main/pipeline/` vì Renderer cũng cần gọi trực tiếp để disable nút Run All/tooltip trước khi user bấm, mà Renderer không được chứa business logic Main theo kiến trúc 3 lớp mục 4). Trả về **message đầu tiên vi phạm** (không phải danh sách đầy đủ), theo đúng thứ tự liệt kê ở trên: transcript rỗng → API key chưa cấu hình → chưa chọn model → `maxCharacters` ngoài khoảng 100–2000 → từng prompt (Character Detection → Character Generation → Scene Generation) rỗng hoặc thiếu placeholder bắt buộc — khớp ví dụ "Scene Prompt thiếu {{SRT_TEXT}}..." ở trên khi vi phạm cuối cùng đó là thứ duy nhất sai.
+**Implementation thật (Phase 9):** `validateProjectForRun()` (`src/shared/validateRun.ts` — không đặt ở `src/main/pipeline/` vì Renderer cũng cần gọi trực tiếp để disable nút Run All/tooltip trước khi user bấm, mà Renderer không được chứa business logic Main theo kiến trúc 3 lớp mục 4). Trả về **message đầu tiên vi phạm** (không phải danh sách đầy đủ), theo đúng thứ tự liệt kê ở trên: transcript rỗng → API key chưa cấu hình → chưa chọn model → `avgCharacters` ngoài khoảng 30–2000 (đổi tên từ `maxCharacters`, Phase 19; min hạ từ 100 xuống 30 ở Phase 24, theo yêu cầu trực tiếp user) → từng prompt (Character Detection → Character Generation → Scene Generation) rỗng hoặc thiếu placeholder bắt buộc — khớp ví dụ "Scene Prompt thiếu {{SRT_TEXT}}..." ở trên khi vi phạm cuối cùng đó là thứ duy nhất sai.
 
 **"API key chưa hợp lệ" không được kiểm tra chủ động** — validate chỉ xác nhận đã **có** key lưu (`vilao.hasApiKey()`), không tự gọi `testConnection()` trước mỗi lần Run (tránh 1 round-trip mạng thừa mỗi lần bấm). Key sai thật sự chỉ lộ ra khi request LLM đầu tiên tự thất bại (401) trong lúc chạy — cùng cách xử lý đã có từ Phase 6 cho các nút trigger thủ công.
 
@@ -2085,7 +2289,7 @@ V1 được xem là hoàn thành khi:
 4. App lấy được danh sách model và hiển thị dropdown.
 5. Người dùng tạo project.
 6. Người dùng paste transcript text.
-7. App chia SRT đúng `maxCharacters`.
+7. App chia SRT theo `avgCharacters`/`variancePercent` (đổi tên từ `maxCharacters`, Phase 19).
 8. App tạo fake timeline.
 9. Một nút Run All chạy được toàn pipeline.
 10. Character Detection tạo Character Database.
@@ -2107,6 +2311,12 @@ V1 được xem là hoàn thành khi:
 
 **Xác nhận thật (Phase 13, 2026-08-09): 25/25 PASS — V1 hoàn thành.** Rà soát toàn bộ 25 mục dựa trên implementation thật đã ghi nhận rải rác từ Phase 2-12 trong tài liệu này, cộng verify trực tiếp bằng Playwright thật (project thật, Split SRT/export thật ra đúng file) trong phiên Phase 13. Không mục nào fail. Chi tiết đối chiếu từng mục: `context/plan.md` → Phase 13 → "Ghi chú hoàn thành".
 
+**Không mục nào bị Phase 14 làm fail lại** (Phase 14 nằm ngoài phạm vi V1, xem mục 40) — riêng mục 9 ("một nút Run All chạy được toàn pipeline") và 16 ("App có resume") vẫn đúng dù cách trigger đổi khác: Run All/Resume giờ trigger được từ TopBar/Processing tab **hoặc** gián tiếp qua Run Queue (mục 6.4); mục 19-21 (export 3 file) vẫn đúng dù trigger đổi từ thủ công sang tự động (mục 8.7/21).
+
+**Mục 16 ("App có resume") bị Phase 15 làm FAIL lại — theo yêu cầu trực tiếp của user, không phải bug.** Nút Resume bị xoá hẳn khỏi UI (mục 7/8.6/6.2) — 1 project `paused` (do Delete-while-running, force-quit giữa chừng, hoặc bất kỳ lý do nào khác) từ giờ **không còn cách nào chạy tiếp được từ giao diện nữa**. Cơ chế Resume ở tầng service (`runProject()` tự gating theo mục 19.3) vẫn còn nguyên và đúng — chỉ là không còn route UI nào gọi tới nó cho case `paused`. Case `failed`/`completed_with_errors` (Retry Failed, dùng chung cơ chế) không bị ảnh hưởng, vẫn PASS. 24/25 PASS kể từ Phase 15.
+
+**Không mục nào bị Phase 16/17 làm fail lại (2026-08-10):** mục 15 ("App có retry") vẫn PASS dù `DEFAULT_MAX_RETRY` hạ xuống 1 và mất UI chỉnh (mục 10.3/19.1) — khác cách mục 16 bị đánh fail, đây không phải xoá hẳn 1 route hành động khỏi UI mà chỉ tuning lại ngân sách mặc định của 1 cơ chế vẫn chạy tự động, nguyên vẹn cho mọi task/batch. Bug fix Overview real-time (mục 8.1) và setting Scene Generation Batch Size mới (mục 17/33) không đụng tới mục DoD nào. Vẫn 24/25 PASS.
+
 ---
 
 # 40. Roadmap
@@ -2126,13 +2336,41 @@ V1 được xem là hoàn thành khi:
 - prompt settings
 - responsive layout + edge case polish (Phase 13)
 
+## Post-V1 — Phase 14 (2026-08-10, ngoài phạm vi V1 gốc)
+
+Không nằm trong kế hoạch ban đầu — phát sinh trực tiếp từ yêu cầu user trong lúc tự chạy/test app thật trên Windows sau khi V1 đã xong. Chi tiết đầy đủ: `context/plan.md` → Phase 14 → "Ghi chú hoàn thành".
+
+- ✅ **Run Queue nhiều project** (mục 6.4) — chính là "Batch controls" ở V1.1 bên dưới, làm sớm hơn kế hoạch.
+- Dọn 3 nút thao tác thủ công đứng thay Run All (Split SRT, Detect Characters, Generate Character Prompts — mục 8.3/8.4) — Run All đã đủ dùng trong thực tế nên không cần nữa.
+- Export tự động hoàn toàn khi Run All xong, Default Export Folder cấu hình 1 lần (mục 8.7/21) — không còn nút Export thủ công.
+- Delete-while-running thay cho Pause/Cancel (mục 37).
+- Fix môi trường dev Windows (build native module, `ELECTRON_RUN_AS_NODE`) — không phải requirement sản phẩm, chỉ ghi lại vì ảnh hưởng tới việc chạy code, xem `context/plan.md`.
+
+## Post-V1 — Phase 15 (2026-08-10, ngoài phạm vi V1 gốc)
+
+Tiếp tục phát sinh trực tiếp từ user trong lúc tự test app thật, cùng phiên với Phase 14.
+
+- **Nút Resume bị xoá hẳn khỏi UI** (TopBar mục 7, Processing tab mục 8.6, Home/Queue row mục 6.2) — `status=paused` giờ chỉ còn badge tĩnh "Paused", không có nút hành động nào. Làm mục 16 DoD (mục 39) fail lại có chủ đích. Retry Failed không bị ảnh hưởng.
+- **Home row và Queue row dùng chung 1 component `ProjectRow.tsx`** (`src/renderer/components/ProjectRow.tsx`, tách ra từ `ProjectsListPage.tsx`) — Queue tab giờ hiện đủ progress bar/status badge giống Home thay vì chỉ tên + trạng thái Queued/Running đơn giản như trước (mục 6.4).
+- **Delete không còn block UI chờ `stopAndWait()`** (mục 37) — modal đóng ngay, xoá chạy nền.
+- Fix bug `useQueueStore` không tự refetch `queue.list()` sau lần `subscribe()` đầu tiên, khiến Queue tab có thể kẹt hiển thị trạng thái cũ nếu lỡ miss 1 `queue:updateEvent` — không phải thay đổi hành vi sản phẩm, chỉ là sửa lỗi để khớp đúng thiết kế gốc.
+- **Bắt đầu đóng gói Windows thật** (`electron-builder.yml`), sớm hơn kế hoạch V2 ở dưới. Phát hiện + fix 1 bug đóng gói nghiêm trọng qua build thật + test trực tiếp `require()` trên chính binary đã đóng gói: `better-sqlite3` (native module) tự phụ thuộc package JS thuần `bindings` để tìm file `.node` — heuristic mặc định của electron-builder chỉ unpack đúng `better-sqlite3` (vì có file `.node`), để `bindings` kẹt lại nén trong `app.asar`; `require('bindings')` từ vị trí đã unpack không "nhảy ngược" vào asar được → app mở lên rồi tắt ngay lập tức lúc chạm SQLite lần đầu, không crash log, không exception hiện ra. Sửa bằng `asar: false` (tắt hẳn, không unpack từng package con) — tránh cả lớp bug này về sau, đổi lấy dung lượng cài đặt lớn hơn 1 chút. Thêm `win.target: nsis`. Chưa build/test bản NSIS installer thật (chỉ mới verify qua `dir` target khi debug) — nên tự build và cài thử trên máy khác trước khi gửi cho người dùng thật.
+
+## Post-V1 — Phase 16 (2026-08-10, ngoài phạm vi V1 gốc)
+
+Tiếp tục phát sinh trực tiếp từ user trong lúc tự chạy/test app thật (bug report + 2 yêu cầu tính năng), cùng ngày với Phase 14/15. (Tối ưu cost/latency cho Internal Relevant Character Selector — batch hoá selector call + local pronoun carry-forward, cũng làm cùng ngày, ghi nhận riêng ở "Cập nhật thật (2026-08-10)" cuối mục 31, không lặp lại ở đây.)
+
+- Fix bug Overview tab không cập nhật real-time khi đang đứng ở trang đó — thoát ra vào lại dashboard mới thấy kết quả (mục 8.1).
+- Hạ `DEFAULT_MAX_RETRY` từ 3 xuống 1, bỏ hẳn ô "Max Retry" khỏi Settings > Advanced > Pipeline Tuning — theo yêu cầu trực tiếp của user, cơ chế retry ở tầng service không đổi (mục 10.3/19.1).
+- Setting mới **Scene Generation Batch Size** (mục 17/33) — số SRT gộp vào 1 request Scene/Image Prompt Generation, trước đó là hằng số cố định `SCENE_PROMPT_BATCH_SIZE = 10`, giờ per-project, chỉnh được qua Settings > Advanced > Pipeline Tuning, range 1–20 (đã hỏi lại user qua `AskUserQuestion` trước khi implement vì đây là schema change thật, theo CLAUDE.md).
+
 ## V1.1
 
 - Search/filter tốt hơn
 - Regenerate selected scenes
 - Better token/context estimator
 - Better character merge/dedup
-- Batch controls
+- ~~Batch controls~~ — đã làm ở Phase 14 (post-V1), xem ở trên
 - Debug logs
 - Export presets
 

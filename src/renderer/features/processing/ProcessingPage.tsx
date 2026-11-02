@@ -1,19 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import {
-  Activity,
-  AlertCircle,
-  AlertTriangle,
-  Check,
-  CircleDot,
-  Loader2,
-  Minus,
-  Octagon,
-  Pause,
-  Play,
-  RotateCw
-} from 'lucide-react'
+import { Activity, AlertCircle, AlertTriangle, Check, CircleDot, Loader2, Minus, RotateCw } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import { Button } from '@renderer/components/ui/Button'
 import { Card } from '@renderer/components/ui/Card'
 import { EmptyState } from '@renderer/components/ui/EmptyState'
 import { ErrorNotice } from '@renderer/components/ui/ErrorNotice'
@@ -23,7 +10,7 @@ import { useProjectStore } from '@renderer/stores/useProjectStore'
 import { usePipelineStore } from '@renderer/stores/usePipelineStore'
 import { ProjectStatus, TaskStatus, TaskType } from '@shared/enums'
 import type { Character, CharacterPrompt, PipelineTask, ScenePrompt, SrtBlock } from '@shared/entities'
-import { validateProjectForRun } from '@shared/validateRun'
+import { getRunBlockedReason } from '@renderer/lib/runValidation'
 
 const COARSE_STEPS: { taskType: TaskType; label: string }[] = [
   { taskType: TaskType.SPLIT_SRT, label: 'Split SRT' },
@@ -56,20 +43,24 @@ function statusIcon(status: TaskStatus): { Icon: LucideIcon; className: string; 
 // pipeline_tasks rows via PipelineService.listTasks) + one row per SRT block
 // for Scene Generation (read straight from scenePrompts.list(), already 1:1
 // with srt_blocks and already carrying status/attempts/error — no second
-// copy of that state). Actions: Run All/Resume/Retry Failed (same call,
-// spec.md 19.3), Pause, Cancel — shared with TopBar via usePipelineStore so
-// both surfaces always agree on whether a run is in flight.
+// copy of that state).
+//
+// Cập nhật (Phase 15, ngoài phạm vi V1 gốc): the Run All/Resume/Retry
+// Failed/Processing…/Completed/Paused/Delete cluster spec.md 8.6 originally
+// had here is gone — it duplicated TopBar.tsx exactly (same
+// usePipelineStore state), and TopBar is visible from every project
+// sub-page including this one, so it's the single place for that now. This
+// tab is display-only: task/progress status, no actions.
 export function ProcessingPage(): JSX.Element {
   const currentProject = useProjectStore((state) => state.currentProject)
   const projectId = currentProject?.id
-  const { subscribe, tasks, run, pause, cancel, isRunning, error } = usePipelineStore()
+  const { subscribe, tasks, isRunning, error } = usePipelineStore()
 
   const [srtBlocks, setSrtBlocks] = useState<SrtBlock[] | null>(null)
   const [characters, setCharacters] = useState<Character[]>([])
   const [characterPrompts, setCharacterPrompts] = useState<CharacterPrompt[]>([])
   const [scenePrompts, setScenePrompts] = useState<ScenePrompt[]>([])
   const [blockedReason, setBlockedReason] = useState<string | undefined>('Loading…')
-  const [isPausing, setIsPausing] = useState(false)
 
   const refresh = useCallback(async (id: string) => {
     const [blocks, characterList, promptList, sceneList] = await Promise.all([
@@ -104,21 +95,34 @@ export function ProcessingPage(): JSX.Element {
     })
   }, [])
 
+  // Bug fix (user report): the 3 coarse steps (Split SRT/Detect Characters/
+  // Generate Character Prompts) only push live updates through `tasks`, not
+  // a dedicated per-row channel — refetch srtBlocks/characters/
+  // characterPrompts whenever a coarse step reports progress. This is what
+  // actually covers a *queue*-triggered run (a brand-new project's only
+  // real starting path, spec.md 6.4): `isRunning` below is a per-window flag
+  // that only ever becomes true when *this* window called run() itself, so
+  // for a queue-triggered run srtBlocks stayed stuck at whatever it was at
+  // mount (often still empty) for the entire run — the Scene Tasks list
+  // never rendered, and the Scene Generation card never left 0/0, until the
+  // user left and reopened the project (a fresh mount). Same fix
+  // OverviewPage.tsx already got in Phase 16 for the exact same reason.
+  useEffect(() => {
+    if (projectId) void refresh(projectId)
+  }, [tasks, projectId, refresh])
+
   // Once a run finishes (isRunning flips back to false), pull a final
-  // authoritative snapshot of everything — covers steps that don't have a
-  // live per-row progress channel (Character Detection/Generation).
+  // authoritative snapshot of everything — extra safety net for a run
+  // started directly from this window (the case above already covers it,
+  // but this catches anything that only changes between the last `tasks`
+  // update and the run truly settling, e.g. the final export step).
   useEffect(() => {
     if (!isRunning && projectId) void refresh(projectId)
   }, [isRunning, projectId, refresh])
 
   useEffect(() => {
     if (!currentProject) return
-    void (async () => {
-      const [settings, hasApiKey] = await Promise.all([appApi.settings.get(), appApi.vilao.hasApiKey()])
-      setBlockedReason(
-        validateProjectForRun(currentProject, settings.promptSettings, hasApiKey, settings.selectedModel) ?? undefined
-      )
-    })()
+    void getRunBlockedReason(currentProject).then(setBlockedReason)
   }, [currentProject])
 
   const taskByType = useMemo(() => new Map(tasks.map((t: PipelineTask) => [t.taskType, t])), [tasks])
@@ -127,42 +131,8 @@ export function ProcessingPage(): JSX.Element {
     return <div />
   }
 
-  const status = currentProject.status
-  const isProcessing = status === ProjectStatus.PROCESSING
-  const isPaused = status === ProjectStatus.PAUSED
-  const isCompleted = status === ProjectStatus.COMPLETED
-  const canRun = !isRunning && !isProcessing && !isCompleted && !blockedReason
+  const isProcessing = currentProject.status === ProjectStatus.PROCESSING
   const hasStarted = srtBlocks !== null && srtBlocks.length > 0
-
-  const runLabel =
-    status === ProjectStatus.DRAFT || status === ProjectStatus.READY
-      ? 'Run All'
-      : status === ProjectStatus.FAILED || status === ProjectStatus.COMPLETED_WITH_ERRORS
-        ? 'Retry Failed'
-        : 'Resume'
-
-  const onRunOrResume = (): void => {
-    if (!canRun) return
-    void run(projectId)
-  }
-
-  const onPause = async (): Promise<void> => {
-    setIsPausing(true)
-    try {
-      await pause(projectId)
-    } finally {
-      setIsPausing(false)
-    }
-  }
-
-  const onCancel = async (): Promise<void> => {
-    setIsPausing(true)
-    try {
-      await cancel(projectId)
-    } finally {
-      setIsPausing(false)
-    }
-  }
 
   const scenePromptByBlockIndex = new Map(scenePrompts.map((sp) => [sp.blockIndex, sp]))
   const sceneSuccessCount = scenePrompts.filter((sp) => sp.status === TaskStatus.SUCCESS).length
@@ -173,39 +143,21 @@ export function ProcessingPage(): JSX.Element {
   const doneUnits = characterPromptSuccessCount + sceneSuccessCount
   const overallProgress = totalUnits > 0 ? Math.round((doneUnits / totalUnits) * 100) : 0
 
+  // Phase 21 — a hasCharacters=false project's DETECT_CHARACTERS/
+  // GENERATE_CHARACTER_PROMPTS tasks are marked success immediately (no real
+  // work, PipelineService.runProjectInternal) — hide those 2 cards rather
+  // than show a trivial "Success" for a step that never actually ran.
+  const coarseSteps = currentProject.hasCharacters
+    ? COARSE_STEPS
+    : COARSE_STEPS.filter((s) => s.taskType === TaskType.SPLIT_SRT)
+
   return (
     <div>
-      <div className="flex items-start justify-between gap-4 mb-6">
-        <div>
-          <h2 className="font-headline-lg text-headline-lg text-text-primary mb-2">Processing</h2>
-          <p className="font-body-md text-body-md text-text-secondary">
-            Pipeline task status — Run All executes spec.md 36&apos;s flow end to end.
-          </p>
-        </div>
-        <div className="flex items-center gap-3">
-          {isProcessing || isRunning ? (
-            <>
-              <Button variant="ghost" type="button" onClick={() => void onPause()} disabled={isPausing}>
-                <Pause size={14} />
-                Pause
-              </Button>
-              <Button variant="ghost" type="button" onClick={() => void onCancel()} disabled={isPausing}>
-                <Octagon size={14} />
-                Cancel
-              </Button>
-            </>
-          ) : isCompleted ? (
-            <span className="flex items-center gap-2 bg-surface-slate border border-border-subtle text-emerald-success font-body-sm text-body-sm px-4 py-1.5 rounded">
-              <Check size={14} />
-              Completed
-            </span>
-          ) : (
-            <Button variant="primary" type="button" onClick={onRunOrResume} disabled={!canRun} title={blockedReason}>
-              <Play size={14} />
-              {isPaused ? 'Resume' : runLabel}
-            </Button>
-          )}
-        </div>
+      <div className="mb-6">
+        <h2 className="font-headline-lg text-headline-lg text-text-primary mb-2">Processing</h2>
+        <p className="font-body-md text-body-md text-text-secondary">
+          Pipeline task status — Run All executes spec.md 36&apos;s flow end to end.
+        </p>
       </div>
 
       {blockedReason && !isProcessing && !isRunning && (
@@ -220,7 +172,7 @@ export function ProcessingPage(): JSX.Element {
         <EmptyState
           icon={Activity}
           title="Pipeline hasn&apos;t run yet"
-          description="Click Run All to execute Split SRT, Character Detection, Character Prompts and Scene Generation end to end."
+          description="Use Run All in the top bar to execute Split SRT, Character Detection, Character Prompts and Scene Generation end to end."
         />
       ) : (
         <>
@@ -244,7 +196,7 @@ export function ProcessingPage(): JSX.Element {
           </Card>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-            {COARSE_STEPS.map(({ taskType, label }) => {
+            {coarseSteps.map(({ taskType, label }) => {
               const task = taskByType.get(taskType)
               const { Icon, className, label: statusLabel } = statusIcon(task?.status ?? TaskStatus.PENDING)
               return (
@@ -270,6 +222,16 @@ export function ProcessingPage(): JSX.Element {
               // even while Detect Characters/Character Prompts were still in
               // progress. Gate on GENERATE_CHARACTER_PROMPTS actually being
               // `success` first.
+              //
+              // `isRunning` on its own also isn't enough on the *other*
+              // side — it's a client-local flag, only true if THIS renderer
+              // called run() itself. A queue-triggered run of a project
+              // whose Processing tab happens to be open never sets it, so
+              // this card was stuck on "Pending" for the entire Scene
+              // Generation phase despite TopBar correctly showing
+              // "Processing…" (found via a live queue-run screenshot).
+              // `isProcessing` (from currentProject.status, kept in sync
+              // regardless of who triggered the run) covers that case.
               const sceneTotal = srtBlocks?.length ?? 0
               const scenePhaseReached = taskByType.get(TaskType.GENERATE_CHARACTER_PROMPTS)?.status === TaskStatus.SUCCESS
               const sceneAllDone = sceneTotal > 0 && sceneSuccessCount + sceneFailedCount === sceneTotal
@@ -278,7 +240,7 @@ export function ProcessingPage(): JSX.Element {
               let colorClass = 'text-text-secondary'
               let label = 'Pending'
               if (scenePhaseReached) {
-                if (isRunning && !sceneAllDone) {
+                if ((isRunning || isProcessing) && !sceneAllDone) {
                   Icon = Loader2
                   colorClass = 'text-vilao-blue'
                   label = 'Running'

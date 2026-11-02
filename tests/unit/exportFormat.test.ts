@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
+  formatCharacterListFile,
   formatCharacterPromptsFile,
   formatImagePromptsFile,
   formatSrtFile,
   formatSrtTimestamp,
-  sanitizeProjectFolderName
+  sanitizeFolderName
 } from '../../src/shared/exportFormat'
 import type { Character, CharacterPrompt, ScenePrompt, SrtBlock } from '../../src/shared/entities'
 
@@ -108,7 +109,7 @@ Nội dung block thứ ba.
 })
 
 describe('formatCharacterPromptsFile', () => {
-  it('matches spec.md 23\'s numbering and separator layout', () => {
+  it('matches spec.md 23\'s inline layout', () => {
     const characters = [
       character({ characterId: '@Qin_Hong_Adult' }),
       character({ characterId: '@Xue_Ge' }),
@@ -120,31 +121,29 @@ describe('formatCharacterPromptsFile', () => {
       characterPrompt({ characterId: '@Lin_San', prompt: 'Character design of @Lin_San, ...' })
     ]
     expect(formatCharacterPromptsFile(characters, prompts)).toBe(
-      `CHARACTER 001 — @Qin_Hong_Adult
+      `@Qin_Hong_Adult: Character design of @Qin_Hong_Adult, ...
 
-Character design of @Qin_Hong_Adult, ...
+@Xue_Ge: Character design of @Xue_Ge, ...
 
-
-CHARACTER 002 — @Xue_Ge
-
-Character design of @Xue_Ge, ...
-
-
-CHARACTER 003 — @Lin_San
-
-Character design of @Lin_San, ...
+@Lin_San: Character design of @Lin_San, ...
 `
     )
   })
 
-  it('skips characters with no successful prompt without leaving a numbering gap', () => {
+  it('skips characters with no successful prompt', () => {
     const characters = [character({ characterId: '@A' }), character({ characterId: '@B' }), character({ characterId: '@C' })]
     const prompts = [
       characterPrompt({ characterId: '@A', prompt: 'Prompt A' }),
       characterPrompt({ characterId: '@B', prompt: null, status: 'failed' }),
       characterPrompt({ characterId: '@C', prompt: 'Prompt C' })
     ]
-    expect(formatCharacterPromptsFile(characters, prompts)).toBe('CHARACTER 001 — @A\n\nPrompt A\n\n\nCHARACTER 002 — @C\n\nPrompt C\n')
+    expect(formatCharacterPromptsFile(characters, prompts)).toBe('@A: Prompt A\n\n@C: Prompt C\n')
+  })
+
+  it('collapses line breaks in stored prompt text to spaces', () => {
+    const characters = [character({ characterId: '@A' })]
+    const prompts = [characterPrompt({ characterId: '@A', prompt: 'Line one\nLine two\r\nLine three' })]
+    expect(formatCharacterPromptsFile(characters, prompts)).toBe('@A: Line one Line two Line three\n')
   })
 
   it('returns an empty string when nothing has a prompt yet', () => {
@@ -152,23 +151,35 @@ Character design of @Lin_San, ...
   })
 })
 
+describe('formatCharacterListFile', () => {
+  it('lists every character\'s ID with the "@" prefix stripped, one per line', () => {
+    const characters = [
+      character({ characterId: '@Hua_An_Ran' }),
+      character({ characterId: '@Hua_An_Ran_Original' }),
+      character({ characterId: '@Qin_Wan' })
+    ]
+    expect(formatCharacterListFile(characters)).toBe('Hua_An_Ran\nHua_An_Ran_Original\nQin_Wan\n')
+  })
+
+  it('includes a character even without a successful prompt (unlike formatCharacterPromptsFile)', () => {
+    const characters = [character({ characterId: '@A' }), character({ characterId: '@B' })]
+    expect(formatCharacterListFile(characters)).toBe('A\nB\n')
+  })
+
+  it('returns an empty string for no characters', () => {
+    expect(formatCharacterListFile([])).toBe('')
+  })
+})
+
 describe('formatImagePromptsFile', () => {
   it('matches spec.md 24\'s numbering and separator layout, 1:1 with SRT index', () => {
     const scenes = [1, 2, 3].map((i) => scenePrompt({ blockIndex: i, prompt: `Comic page layout, ... ${i}` }))
     expect(formatImagePromptsFile(scenes)).toBe(
-      `PROMPT 001:
+      `PROMPT 001: Comic page layout, ... 1
 
-Comic page layout, ... 1
+PROMPT 002: Comic page layout, ... 2
 
-
-PROMPT 002:
-
-Comic page layout, ... 2
-
-
-PROMPT 003:
-
-Comic page layout, ... 3
+PROMPT 003: Comic page layout, ... 3
 `
     )
   })
@@ -178,25 +189,26 @@ Comic page layout, ... 3
       scenePrompt({ blockIndex: 1, prompt: null, status: 'failed' }),
       scenePrompt({ blockIndex: 2, prompt: 'Prompt for scene 2' })
     ]
-    expect(formatImagePromptsFile(scenes)).toBe('PROMPT 002:\n\nPrompt for scene 2\n')
+    expect(formatImagePromptsFile(scenes)).toBe('PROMPT 002: Prompt for scene 2\n')
   })
 
   it('sorts by blockIndex regardless of input order', () => {
     const scenes = [scenePrompt({ blockIndex: 2, prompt: 'Second' }), scenePrompt({ blockIndex: 1, prompt: 'First' })]
-    expect(formatImagePromptsFile(scenes)).toBe('PROMPT 001:\n\nFirst\n\n\nPROMPT 002:\n\nSecond\n')
+    expect(formatImagePromptsFile(scenes)).toBe('PROMPT 001: First\n\nPROMPT 002: Second\n')
   })
 })
 
-describe('sanitizeProjectFolderName', () => {
+describe('sanitizeFolderName', () => {
   it('keeps spaces and unicode as-is', () => {
-    expect(sanitizeProjectFolderName('My Project Chương 1')).toBe('My Project Chương 1')
+    expect(sanitizeFolderName('My Project Chương 1', 'Untitled_Project')).toBe('My Project Chương 1')
   })
 
   it('replaces filesystem-invalid characters', () => {
-    expect(sanitizeProjectFolderName('Weird: Name / Test?')).toBe('Weird_ Name _ Test_')
+    expect(sanitizeFolderName('Weird: Name / Test?', 'Untitled_Project')).toBe('Weird_ Name _ Test_')
   })
 
-  it('falls back to a default name when empty after trimming', () => {
-    expect(sanitizeProjectFolderName('   ')).toBe('Untitled_Project')
+  it('falls back to the given default when empty after trimming', () => {
+    expect(sanitizeFolderName('   ', 'Untitled_Project')).toBe('Untitled_Project')
+    expect(sanitizeFolderName('   ', 'Untitled_Channel')).toBe('Untitled_Channel')
   })
 })

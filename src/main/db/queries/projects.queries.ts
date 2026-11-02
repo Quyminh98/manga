@@ -10,16 +10,20 @@ interface ProjectRow {
   name: string
   transcript: string
   status: string
+  channel_id: string
   selected_model: string | null
-  max_characters: number
+  avg_characters: number
+  variance_percent: number
   fake_duration_sec: number
   max_retry: number
   scene_concurrency: number
+  scene_batch_size: number
+  has_characters: number
   character_detection_prompt_snapshot: string | null
   character_generation_prompt_snapshot: string | null
   scene_generation_prompt_snapshot: string | null
   selected_model_snapshot: string | null
-  max_characters_snapshot: number | null
+  avg_characters_snapshot: number | null
   fake_duration_snapshot: number | null
   created_at: string
   updated_at: string
@@ -27,6 +31,7 @@ interface ProjectRow {
 }
 
 interface ProjectSummaryRow extends ProjectRow {
+  channel_name: string
   srt_count: number
   character_count: number
   character_prompt_done: number
@@ -40,16 +45,20 @@ function toProject(row: ProjectRow): Project {
     name: row.name,
     transcript: row.transcript,
     status: row.status as ProjectStatus,
+    channelId: row.channel_id,
     selectedModel: row.selected_model,
-    maxCharacters: row.max_characters,
+    avgCharacters: row.avg_characters,
+    variancePercent: row.variance_percent,
     fakeDurationSec: row.fake_duration_sec,
     maxRetry: row.max_retry,
     sceneConcurrency: row.scene_concurrency,
+    sceneBatchSize: row.scene_batch_size,
+    hasCharacters: row.has_characters === 1,
     characterDetectionPromptSnapshot: row.character_detection_prompt_snapshot,
     characterGenerationPromptSnapshot: row.character_generation_prompt_snapshot,
     sceneGenerationPromptSnapshot: row.scene_generation_prompt_snapshot,
     selectedModelSnapshot: row.selected_model_snapshot,
-    maxCharactersSnapshot: row.max_characters_snapshot,
+    avgCharactersSnapshot: row.avg_characters_snapshot,
     fakeDurationSnapshot: row.fake_duration_snapshot,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -61,20 +70,20 @@ export function insertProject(db: Database.Database, project: Project): void {
   db.prepare(
     `
     INSERT INTO projects (
-      id, name, transcript, status, selected_model, max_characters, fake_duration_sec,
-      max_retry, scene_concurrency, character_detection_prompt_snapshot,
+      id, name, transcript, status, channel_id, selected_model, avg_characters, variance_percent, fake_duration_sec,
+      max_retry, scene_concurrency, scene_batch_size, has_characters, character_detection_prompt_snapshot,
       character_generation_prompt_snapshot, scene_generation_prompt_snapshot,
-      selected_model_snapshot, max_characters_snapshot, fake_duration_snapshot,
+      selected_model_snapshot, avg_characters_snapshot, fake_duration_snapshot,
       created_at, updated_at, last_opened_at
     ) VALUES (
-      @id, @name, @transcript, @status, @selectedModel, @maxCharacters, @fakeDurationSec,
-      @maxRetry, @sceneConcurrency, @characterDetectionPromptSnapshot,
+      @id, @name, @transcript, @status, @channelId, @selectedModel, @avgCharacters, @variancePercent, @fakeDurationSec,
+      @maxRetry, @sceneConcurrency, @sceneBatchSize, @hasCharacters, @characterDetectionPromptSnapshot,
       @characterGenerationPromptSnapshot, @sceneGenerationPromptSnapshot,
-      @selectedModelSnapshot, @maxCharactersSnapshot, @fakeDurationSnapshot,
+      @selectedModelSnapshot, @avgCharactersSnapshot, @fakeDurationSnapshot,
       @createdAt, @updatedAt, @lastOpenedAt
     )
     `
-  ).run(project)
+  ).run({ ...project, hasCharacters: project.hasCharacters ? 1 : 0 })
 }
 
 export function findProjectById(db: Database.Database, id: string): Project | null {
@@ -115,7 +124,7 @@ export function updateProjectRunSnapshot(
     characterGenerationPromptSnapshot: string
     sceneGenerationPromptSnapshot: string
     selectedModelSnapshot: string
-    maxCharactersSnapshot: number
+    avgCharactersSnapshot: number
     fakeDurationSnapshot: number
   },
   updatedAt: string
@@ -126,7 +135,7 @@ export function updateProjectRunSnapshot(
        character_generation_prompt_snapshot = @characterGenerationPromptSnapshot,
        scene_generation_prompt_snapshot = @sceneGenerationPromptSnapshot,
        selected_model_snapshot = @selectedModelSnapshot,
-       max_characters_snapshot = @maxCharactersSnapshot,
+       avg_characters_snapshot = @avgCharactersSnapshot,
        fake_duration_snapshot = @fakeDurationSnapshot,
        selected_model = @selectedModelSnapshot,
        updated_at = @updatedAt
@@ -137,15 +146,18 @@ export function updateProjectRunSnapshot(
 // Advanced Settings > Pipeline Tuning (plan.md Phase 9) — per-project fields,
 // not AppSettings (schema.md doesn't have a global maxRetry/sceneConcurrency;
 // see plan.md Phase 4 notes on why maxRetry stays off AppSettings).
+// sceneBatchSize added later (2026-08-10, user request) — same per-project
+// convention, still 1 UPDATE for all 3 fields together.
 export function updateProjectPipelineSettings(
   db: Database.Database,
   id: string,
-  settings: { maxRetry: number; sceneConcurrency: number },
+  settings: { maxRetry: number; sceneConcurrency: number; sceneBatchSize: number },
   updatedAt: string
 ): void {
-  db.prepare('UPDATE projects SET max_retry = ?, scene_concurrency = ?, updated_at = ? WHERE id = ?').run(
+  db.prepare('UPDATE projects SET max_retry = ?, scene_concurrency = ?, scene_batch_size = ?, updated_at = ? WHERE id = ?').run(
     settings.maxRetry,
     settings.sceneConcurrency,
+    settings.sceneBatchSize,
     updatedAt,
     id
   )
@@ -169,6 +181,7 @@ export function listProjectSummaries(db: Database.Database): ProjectSummary[] {
       `
       SELECT
         p.*,
+        ch.name AS channel_name,
         (SELECT COUNT(*) FROM srt_blocks sb WHERE sb.project_id = p.id) AS srt_count,
         (SELECT COUNT(*) FROM characters c WHERE c.project_id = p.id) AS character_count,
         (SELECT COUNT(*) FROM character_prompts cp WHERE cp.project_id = p.id AND cp.status = 'success') AS character_prompt_done,
@@ -178,6 +191,7 @@ export function listProjectSummaries(db: Database.Database): ProjectSummary[] {
           (SELECT COUNT(*) FROM scene_prompts spf WHERE spf.project_id = p.id AND spf.status = 'failed')
         ) AS failed_task_count
       FROM projects p
+      JOIN channels ch ON ch.id = p.channel_id
       ORDER BY p.updated_at DESC
       `
     )
@@ -190,6 +204,7 @@ export function listProjectSummaries(db: Database.Database): ProjectSummary[] {
 
     return {
       ...toProject(row),
+      channelName: row.channel_name,
       srtCount: row.srt_count,
       characterCount: row.character_count,
       characterPromptDone: row.character_prompt_done,

@@ -5,8 +5,24 @@ directories:
   buildResources: build
 files:
   - out/**/*
+# asar disabled: better-sqlite3 (a native module) requires the pure-JS
+# `bindings` helper package to locate its own .node file at runtime.
+# electron-builder's default asarUnpack heuristic only unpacks packages that
+# directly contain a .node file, so `bindings` was left compressed inside
+# app.asar while better-sqlite3 itself got unpacked next to it —
+# require('bindings') then fails because Node's module resolution walks real
+# directories from the unpacked location and has no way to "step back into"
+# the asar archive to find it. Confirmed via a real packaged build: the app
+# opened and silently exited (code 0) the instant DatabaseService tried to
+# open SQLite. Turning asar off avoids this whole class of bug (every file
+# is a real path, same require() behavior as dev) rather than hand-picking
+# every transitive dependency that also needs asarUnpack.
+asar: false
 mac:
   category: public.app-category.productivity
   target:
     - dmg
     - zip
+win:
+  target:
+    - nsis

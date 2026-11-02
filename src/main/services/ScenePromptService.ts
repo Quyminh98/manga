@@ -1,9 +1,10 @@
 import { randomUUID } from 'crypto'
 import type Database from 'better-sqlite3'
-import type { Character, ScenePrompt, SrtBlock } from '@shared/entities'
-import { ErrorCode, TaskStatus } from '@shared/enums'
+import type { Character, Project, ScenePrompt, SrtBlock } from '@shared/entities'
+import { ErrorCode, TaskStatus, TaskType } from '@shared/enums'
 import { formatStoredError } from '@shared/errorCode'
 import { getMissingPlaceholders } from '@shared/prompts'
+import { withMinimalThinking } from '@shared/llmProviders'
 import type { ScenePromptGenerationProgress } from '@shared/ipc-types'
 import { findProjectById } from '../db/queries/projects.queries'
 import { listSrtBlocksByProjectId } from '../db/queries/srtBlocks.queries'
@@ -11,12 +12,14 @@ import { listCharactersByProjectId } from '../db/queries/characters.queries'
 import { listCharacterPromptsByProjectId } from '../db/queries/characterPrompts.queries'
 import { deleteScenePromptsByProjectId, listScenePromptsByProjectId, upsertScenePrompt } from '../db/queries/scenePrompts.queries'
 import { rateLimitDelayMs, sleep } from '../pipeline/backoff'
+import { runWithConcurrency } from '../pipeline/concurrency'
 import { classifyError } from '../pipeline/errorClassification'
 import {
+  buildBatchRelevantCharacterSelectorMessages,
   buildCompactCharacterIndex,
-  buildRelevantCharacterSelectorMessages,
-  matchLocalRelevantCharacterIds,
-  parseRelevantCharacterSelectorResponse
+  parseBatchRelevantCharacterSelectorResponse,
+  resolveLocalRelevantCharacterIds,
+  type BatchSelectorItem
 } from '../pipeline/selectRelevantCharacters'
 import {
   assembleSceneContext,
@@ -31,14 +34,12 @@ import {
   type SceneBatchNeighbors,
   type SceneNeighborContext
 } from '../pipeline/generateScenePrompt'
-import type { VilaoService } from './VilaoService'
+import type { LlmClient } from '../llm/LlmClient'
 
 export interface GenerateScenePromptsParams {
-  vilaoService: VilaoService
+  llmClient: LlmClient
   promptTemplate: string
-  // Same convention as CharacterService's params — the IPC layer resolves
-  // AppSettings.selectedModel and passes it in explicitly; per-project model
-  // snapshots don't exist until Phase 9 (spec.md 32).
+  // Resolved by the caller (pipeline/runtime.ts or PipelineService's snapshot).
   model: string
 }
 
@@ -59,38 +60,23 @@ interface BackoffState {
   pauseUntil: number
 }
 
-// Bounded-concurrency task pool: `concurrency` workers each pull the next
-// unstarted item (in order) and run `worker` on it, until every item has
-// been processed. No third-party dependency — small enough to inline, and
-// this is the only place in the app that currently needs it. Items may
-// finish out of order relative to each other, but each worker always starts
-// its items in array order.
-// `shouldContinue` (optional) is polled before a worker picks up its next
-// item — Pause/Cancel support (plan.md Phase 9): once it returns false, no
-// new batch starts, but whatever a worker already started keeps running to
-// completion ("request đang chạy được phép hoàn thành", spec.md 37).
-async function runWithConcurrency<T>(
-  items: T[],
-  concurrency: number,
-  worker: (item: T, index: number) => Promise<void>,
+// Everything generateBatch needs that stays the same for every batch of one
+// generate()/retry() call — built once by buildBatchContext.
+interface BatchContext {
+  projectId: string
+  maxRetry: number
+  allBlocks: SrtBlock[]
+  characters: Character[]
+  promptByCharacterId: Map<string, string>
+  localSelectionByBlockIndex: Map<number, string[]>
+  params: GenerateScenePromptsParams
+  backoffState: BackoffState
   shouldContinue?: () => boolean
-): Promise<void> {
-  let cursor = 0
-  const workerCount = Math.min(concurrency, items.length)
-  await Promise.all(
-    Array.from({ length: workerCount }, async () => {
-      while (cursor < items.length) {
-        if (shouldContinue && !shouldContinue()) return
-        const index = cursor++
-        await worker(items[index], index)
-      }
-    })
-  )
 }
 
 // spec.md 17 — Step 5: Scene Prompt Generation. No electron import — same
 // convention as CharacterService/SrtService, unit-testable via
-// createDatabase(':memory:') and a fake VilaoService.
+// createDatabase(':memory:') and a fake LlmClient.
 export class ScenePromptService {
   constructor(private readonly db: Database.Database) {}
 
@@ -100,12 +86,13 @@ export class ScenePromptService {
 
   // Generates exactly one Scene Prompt per SRT block (1:1, spec.md 17/schema.md
   // scene_prompts unique(project_id, srt_block_id)), batching
-  // SCENE_PROMPT_BATCH_SIZE (default 10) consecutive blocks per LLM request
-  // (spec.md 17 — added after V1 shipped too slowly at 1 SRT/request). Runs
-  // up to project.sceneConcurrency (spec.md 33 — default 4, range 1-5;
-  // per-project, configurable via Settings > Advanced > Pipeline Tuning,
-  // `projects.scene_concurrency` column has been there since Phase 2)
-  // batches at once instead of one at a time — batches are built
+  // project.sceneBatchSize (spec.md 17 — default 10, range 1-30; per-project,
+  // configurable via Settings > Advanced > Pipeline Tuning, added 2026-08-10)
+  // consecutive blocks per LLM request (added after V1 shipped too slowly at
+  // 1 SRT/request). Runs up to project.sceneConcurrency (spec.md 33 —
+  // default 4, range 1-10; per-project, configurable via Settings > Advanced >
+  // Pipeline Tuning, `projects.scene_concurrency` column has been there
+  // since Phase 2) batches at once instead of one at a time — batches are built
   // from non-overlapping SRT block ranges, so running several concurrently
   // never touches the same DB row from two batches at once. `onProgress`
   // (optional — unit tests don't need it) fires once per finished batch,
@@ -134,23 +121,11 @@ export class ScenePromptService {
       throw new Error('Split the transcript into SRT blocks before generating Image Prompts.')
     }
 
-    const missing = getMissingPlaceholders('sceneGeneration', params.promptTemplate)
-    if (missing.length > 0) {
-      throw new Error(
-        `Scene Generation prompt is missing required placeholder(s): ${missing.join(', ')}. Fix it in Settings > Prompts.`
-      )
-    }
-
-    const characters = listCharactersByProjectId(this.db, projectId)
-    const promptByCharacterId = this.buildPromptByCharacterId(projectId)
+    const ctx = this.buildBatchContext(project, blocks, params, shouldContinue)
     const existingByBlockIndex = new Map(this.list(projectId).map((sp) => [sp.blockIndex, sp]))
 
-    const batches = chunkSrtBlocks(blocks)
+    const batches = chunkSrtBlocks(blocks, project.sceneBatchSize)
     const batchStarts = batches.map((_, i) => batches.slice(0, i).reduce((sum, b) => sum + b.length, 0))
-
-    // Shared across every concurrent batch worker below (spec.md 33 — see
-    // BackoffState's own comment).
-    const backoffState: BackoffState = { pauseUntil: 0 }
 
     let completedBlocks = 0
     let batchesCompleted = 0
@@ -160,9 +135,7 @@ export class ScenePromptService {
       async (batch, i) => {
         const alreadyDone = batch.every((b) => existingByBlockIndex.get(b.blockIndex)?.status === TaskStatus.SUCCESS)
         if (!alreadyDone) {
-          await this.generateBatch(
-            projectId, project.maxRetry, blocks, batchStarts[i], batch.length, characters, promptByCharacterId, params, backoffState, shouldContinue
-          )
+          await this.generateBatch(ctx, batchStarts[i], batch.length)
         }
         completedBlocks += batch.length
         batchesCompleted += 1
@@ -193,17 +166,7 @@ export class ScenePromptService {
     const index = blocks.findIndex((b) => b.blockIndex === blockIndex)
     if (index === -1) throw new Error(`SRT block not found: ${blockIndex}`)
 
-    const missing = getMissingPlaceholders('sceneGeneration', params.promptTemplate)
-    if (missing.length > 0) {
-      throw new Error(
-        `Scene Generation prompt is missing required placeholder(s): ${missing.join(', ')}. Fix it in Settings > Prompts.`
-      )
-    }
-
-    const characters = listCharactersByProjectId(this.db, projectId)
-    const promptByCharacterId = this.buildPromptByCharacterId(projectId)
-
-    await this.generateBatch(projectId, project.maxRetry, blocks, index, 1, characters, promptByCharacterId, params, { pauseUntil: 0 })
+    await this.generateBatch(this.buildBatchContext(project, blocks, params), index, 1)
 
     const updated = this.list(projectId).find((sp) => sp.blockIndex === blockIndex)
     if (!updated) throw new Error(`Scene Prompt not found after retry: ${blockIndex}`)
@@ -217,6 +180,41 @@ export class ScenePromptService {
     deleteScenePromptsByProjectId(this.db, projectId)
   }
 
+  private buildBatchContext(
+    project: Project,
+    blocks: SrtBlock[],
+    params: GenerateScenePromptsParams,
+    shouldContinue?: () => boolean
+  ): BatchContext {
+    // Phase 22 — a hasCharacters=false project's promptTemplate is the
+    // sceneGenerationPromptNoCharacters variant (no {{RELEVANT_CHARACTERS}}/
+    // {{RELEVANT_CHARACTER_PROMPTS}} placeholders by design), so it's checked
+    // against that template's own required set.
+    const missing = getMissingPlaceholders(project.hasCharacters ? 'sceneGeneration' : 'sceneGenerationNoCharacters', params.promptTemplate)
+    if (missing.length > 0) {
+      throw new Error(
+        `Scene Generation prompt is missing required placeholder(s): ${missing.join(', ')}. Fix it in Settings > Prompts.`
+      )
+    }
+
+    const characters = listCharactersByProjectId(this.db, project.id)
+    return {
+      projectId: project.id,
+      maxRetry: project.maxRetry,
+      allBlocks: blocks,
+      characters,
+      promptByCharacterId: this.buildPromptByCharacterId(project.id),
+      // 2026-08-10 — pre-pass over the full block list, once, before batching:
+      // direct name matches + pronoun carry-forward (spec.md 16.2/16.3). Cuts
+      // how many blocks still need the LLM selector fallback.
+      localSelectionByBlockIndex: resolveLocalRelevantCharacterIds(blocks, characters),
+      params,
+      // Shared across every concurrent batch worker (spec.md 33 — see BackoffState).
+      backoffState: { pauseUntil: 0 },
+      shouldContinue
+    }
+  }
+
   private buildPromptByCharacterId(projectId: string): Map<string, string> {
     const characterPrompts = listCharacterPromptsByProjectId(this.db, projectId)
     return new Map(
@@ -224,18 +222,9 @@ export class ScenePromptService {
     )
   }
 
-  private async generateBatch(
-    projectId: string,
-    maxRetry: number,
-    allBlocks: SrtBlock[],
-    batchStart: number,
-    batchLength: number,
-    characters: Character[],
-    promptByCharacterId: Map<string, string>,
-    params: GenerateScenePromptsParams,
-    backoffState: BackoffState,
-    shouldContinue?: () => boolean
-  ): Promise<void> {
+  private async generateBatch(ctx: BatchContext, batchStart: number, batchLength: number): Promise<void> {
+    const { projectId, maxRetry, allBlocks, characters, promptByCharacterId, localSelectionByBlockIndex, params, backoffState, shouldContinue } =
+      ctx
     const batch = allBlocks.slice(batchStart, batchStart + batchLength)
     const neighbors: SceneBatchNeighbors = {
       previous: batchStart > 0 ? allBlocks[batchStart - 1] : null,
@@ -243,23 +232,34 @@ export class ScenePromptService {
       next: batchStart + batchLength < allBlocks.length ? allBlocks[batchStart + batchLength] : null
     }
 
-    // Relevant-character selection stays per-SRT (relevance genuinely
-    // differs block to block) — only the LLM generation call itself is
-    // batched. Each block's own immediate siblings (not just the batch's
-    // outer neighbors) are used for local matching/selector context, same
-    // window as before batching existed.
+    // Relevance genuinely differs block to block, so selection stays per-SRT
+    // — but resolving it is now 2 tiers: the precomputed local pre-pass
+    // (direct name match or pronoun carry-forward, resolveLocalRelevantCharacterIds)
+    // first; only blocks it couldn't resolve go to the LLM selector, batched
+    // into a single request for the whole scene-generation batch (2026-08-10
+    // — mirrors how the Scene Generation call itself is already batched)
+    // instead of 1 selector request per block. Each unresolved block's own
+    // immediate siblings (not just the batch's outer neighbors) still build
+    // its selector context, same window as before batching existed.
     const selectionByBlockIndex = new Map<number, RelevantSelection>()
+    const needsSelector: BatchSelectorItem[] = []
     for (let i = 0; i < batch.length; i++) {
       const globalIndex = batchStart + i
+      const localIds = localSelectionByBlockIndex.get(batch[i].blockIndex) ?? []
+      if (localIds.length > 0 || characters.length === 0) {
+        selectionByBlockIndex.set(batch[i].blockIndex, { characterIds: localIds, usedFallback: false })
+        continue
+      }
       const blockNeighbors: SceneNeighborContext = {
         previous: globalIndex > 0 ? allBlocks[globalIndex - 1] : null,
         current: batch[i],
         next: globalIndex < allBlocks.length - 1 ? allBlocks[globalIndex + 1] : null
       }
-      selectionByBlockIndex.set(
-        batch[i].blockIndex,
-        await this.selectRelevantCharacters(blockNeighbors, characters, maxRetry, params, backoffState)
-      )
+      needsSelector.push({ blockNumber: batch[i].blockIndex, srtWithNeighborContext: buildNeighborSrtText(blockNeighbors) })
+    }
+    if (needsSelector.length > 0) {
+      const batchSelection = await this.selectRelevantCharactersBatch(ctx, needsSelector)
+      for (const [blockIndex, selection] of batchSelection) selectionByBlockIndex.set(blockIndex, selection)
     }
 
     const selections = [...selectionByBlockIndex.values()]
@@ -321,7 +321,13 @@ export class ScenePromptService {
       )
       try {
         const messages = buildSceneGenerationMessages(params.promptTemplate, formatBlockNumberRange(batch), context)
-        const response = await params.vilaoService.chat({ model: params.model, messages })
+        const response = await params.llmClient.chat({
+          model: params.model,
+          messages,
+          meta: { projectId, step: TaskType.GENERATE_SCENE_PROMPT },
+          jsonMode: true,
+          shouldContinue
+        })
         const promptsByBlockIndex = parseSceneGenerationResponse(response.content, blockIndexes)
 
         const persist = this.db.transaction(() => {
@@ -379,12 +385,8 @@ export class ScenePromptService {
       // is already running inside one of runWithConcurrency's workers, and
       // splitting is the rare/expensive fallback path, not the common case.
       const mid = Math.ceil(batch.length / 2)
-      await this.generateBatch(
-        projectId, maxRetry, allBlocks, batchStart, mid, characters, promptByCharacterId, params, backoffState, shouldContinue
-      )
-      await this.generateBatch(
-        projectId, maxRetry, allBlocks, batchStart + mid, batch.length - mid, characters, promptByCharacterId, params, backoffState, shouldContinue
-      )
+      await this.generateBatch(ctx, batchStart, mid)
+      await this.generateBatch(ctx, batchStart + mid, batch.length - mid)
       return
     }
 
@@ -412,25 +414,18 @@ export class ScenePromptService {
     persist()
   }
 
-  // spec.md 16.2 — local exact-name/alias matching first; if that finds
-  // nothing (not confident enough), a short internal LLM call selects
-  // Character IDs instead (spec.md 31), retried up to maxRetry. If the
-  // selector still fails after every attempt, falls back per spec.md 31.
-  private async selectRelevantCharacters(
-    neighbors: SceneNeighborContext,
-    characters: Character[],
-    maxRetry: number,
-    params: GenerateScenePromptsParams,
-    backoffState: BackoffState
-  ): Promise<RelevantSelection> {
-    if (characters.length === 0) return { characterIds: [], usedFallback: false }
-
-    const localMatches = matchLocalRelevantCharacterIds(neighbors.current.text, characters)
-    if (localMatches.length > 0) return { characterIds: localMatches, usedFallback: false }
-
+  // spec.md 16.2/31 — resolves every block the local pre-pass (generate()/
+  // retry(), resolveLocalRelevantCharacterIds) couldn't, in a single batched
+  // LLM call (2026-08-10 — was 1 call per block, see this method's own
+  // history) retried up to maxRetry. parseBatchRelevantCharacterSelectorResponse
+  // is lenient about individual missing blocks, so a retry here only fires
+  // for a genuinely unparseable response; on final exhaustion every block in
+  // this call falls back per spec.md 31 (empty selection, usedFallback true).
+  private async selectRelevantCharactersBatch(ctx: BatchContext, items: BatchSelectorItem[]): Promise<Map<number, RelevantSelection>> {
+    const { projectId, characters, maxRetry, params, backoffState } = ctx
     const compactIndex = buildCompactCharacterIndex(characters)
-    const srtWithNeighborContext = buildNeighborSrtText(neighbors)
     const validIds = characters.map((c) => c.characterId)
+    const blockNumbers = items.map((item) => item.blockNumber)
 
     let rateLimitStreak = 0
     for (let attempt = 1; attempt <= maxRetry; attempt++) {
@@ -438,10 +433,20 @@ export class ScenePromptService {
         await sleep(backoffState.pauseUntil - Date.now())
       }
       try {
-        const messages = buildRelevantCharacterSelectorMessages(srtWithNeighborContext, compactIndex)
-        const response = await params.vilaoService.chat({ model: params.model, messages })
-        const ids = parseRelevantCharacterSelectorResponse(response.content, validIds)
-        return { characterIds: ids, usedFallback: false }
+        const messages = buildBatchRelevantCharacterSelectorMessages(items, compactIndex)
+        // Phase 28 — a simple classification task: always the cheapest thinking
+        // level the model allows, whatever the channel's own level is (thinking
+        // tokens made up most of this step's cost/latency).
+        const response = await params.llmClient.chat({
+          model: withMinimalThinking(params.model),
+          messages,
+          meta: { projectId, step: TaskType.SELECT_RELEVANT_CHARACTERS },
+          jsonMode: true
+        })
+        const idsByBlockNumber = parseBatchRelevantCharacterSelectorResponse(response.content, blockNumbers, validIds)
+        return new Map(
+          blockNumbers.map((n) => [n, { characterIds: idsByBlockNumber.get(n) ?? [], usedFallback: false }])
+        )
       } catch (err) {
         // spec.md 33 — same shared backoff pool as generateBatch's main
         // generation call; a rate limit here slows down the whole
@@ -455,6 +460,6 @@ export class ScenePromptService {
       }
     }
 
-    return { characterIds: [], usedFallback: true }
+    return new Map(blockNumbers.map((n) => [n, { characterIds: [], usedFallback: true }]))
   }
 }

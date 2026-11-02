@@ -1,156 +1,53 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, Copy, RefreshCw, RotateCw, Search, Sparkles, Users, Wand2 } from 'lucide-react'
+import { Copy, RotateCw, Search, Users } from 'lucide-react'
 import { Button } from '@renderer/components/ui/Button'
 import { EmptyState } from '@renderer/components/ui/EmptyState'
 import { ErrorNotice } from '@renderer/components/ui/ErrorNotice'
-import { Modal } from '@renderer/components/ui/Modal'
 import { appApi } from '@renderer/lib/appApi'
 import { formatErrorForDisplay } from '@renderer/lib/errorDisplay'
+import { usePipelineStore } from '@renderer/stores/usePipelineStore'
 import { useProjectStore } from '@renderer/stores/useProjectStore'
-import { getMissingPlaceholders } from '@shared/prompts'
+import { ProjectStatus } from '@shared/enums'
 import type { Character, CharacterPrompt } from '@shared/entities'
 
-// spec.md 20 — Regenerate: after Character Detection has already run once,
-// re-running it replaces the whole Character Database, which can leave
-// existing Image Prompts referencing characters that no longer exist/changed
-// — confirm which of the 3 choices the user wants instead of just doing it.
-interface RegenerateCharactersModalProps {
-  hasImagePrompts: boolean
-  busy: boolean
-  onCancel: () => void
-  onConfirm: (clearScenePrompts: boolean) => void
-}
-
-function RegenerateCharactersModal({ hasImagePrompts, busy, onCancel, onConfirm }: RegenerateCharactersModalProps): JSX.Element {
-  return (
-    <Modal open onClose={onCancel} title="Regenerate Characters">
-      <p className="font-body-md text-body-md text-text-secondary mb-4">
-        This re-runs Character Detection and replaces the Character Database.
-        {hasImagePrompts &&
-          ' Existing Image Prompts were generated against the current characters and may no longer match afterward.'}
-      </p>
-      <div className="flex flex-col gap-2">
-        <Button variant="primary" type="button" onClick={() => onConfirm(false)} disabled={busy}>
-          Regenerate characters only
-        </Button>
-        <Button variant="danger" type="button" onClick={() => onConfirm(true)} disabled={busy}>
-          Regenerate characters + all Image Prompts
-        </Button>
-        <Button variant="ghost" type="button" onClick={onCancel} disabled={busy}>
-          Cancel
-        </Button>
-      </div>
-    </Modal>
-  )
-}
-
-// spec.md 8.4 — Character Database. "Detect Characters" and "Generate
-// Character Prompts" are temporary manual triggers (same pattern as SrtPage's
-// "Split SRT", plan.md Phase 5) standing in for Run All, which arrives in
-// Phase 9. No Stitch screen exists for this page (generate_screen_from_text
-// timed out twice in Phase 6, see plan.md) — built directly with Tailwind
-// against DESIGN.md tokens, so the Character Prompt column added in Phase 7
-// follows that same convention rather than Stitch's edit_screens.
+// spec.md 8.4 — Character Database. Detection and prompt generation are
+// driven by Run All (Phase 9); this page displays results and lets the user
+// retry an individual failed Character Prompt. No Stitch screen exists for
+// this page (generate_screen_from_text timed out twice in Phase 6, see
+// plan.md) — built directly with Tailwind against DESIGN.md tokens, so the
+// Character Prompt column added in Phase 7 follows that same convention
+// rather than Stitch's edit_screens.
 export function CharactersPage(): JSX.Element {
   const currentProject = useProjectStore((state) => state.currentProject)
   const projectId = currentProject?.id
+  // Main rejects a manual Retry while the project is running (Phase 29) —
+  // disable it here too so the user doesn't hit that error.
+  const isPipelineRunning = usePipelineStore((state) => state.isRunning)
+  const isProcessing = isPipelineRunning || currentProject?.status === ProjectStatus.PROCESSING
 
   const [characters, setCharacters] = useState<Character[] | null>(null)
   const [prompts, setPrompts] = useState<CharacterPrompt[] | null>(null)
-  const [hasImagePrompts, setHasImagePrompts] = useState(false)
   const [search, setSearch] = useState('')
-  const [isDetecting, setIsDetecting] = useState(false)
-  const [isGenerating, setIsGenerating] = useState(false)
-  const [showRegenerateDialog, setShowRegenerateDialog] = useState(false)
   const [retryingCharacterId, setRetryingCharacterId] = useState<string | null>(null)
   const [copiedCharacterId, setCopiedCharacterId] = useState<string | null>(null)
-  const [error, setError] = useState<string | null>(null)
   const [promptsError, setPromptsError] = useState<string | null>(null)
-  const [missingPlaceholders, setMissingPlaceholders] = useState<{
-    characterDetection: string[]
-    characterGeneration: string[]
-  }>({ characterDetection: [], characterGeneration: [] })
 
   const refresh = useCallback(async (id: string) => {
-    const [characterList, promptList, scenePromptList] = await Promise.all([
+    const [characterList, promptList] = await Promise.all([
       appApi.characters.list(id),
-      appApi.characters.listPrompts(id),
-      appApi.scenePrompts.list(id)
+      appApi.characters.listPrompts(id)
     ])
     setCharacters(characterList)
     setPrompts(promptList)
-    setHasImagePrompts(scenePromptList.length > 0)
   }, [])
 
   useEffect(() => {
     setCharacters(null)
     setPrompts(null)
-    setHasImagePrompts(false)
     setSearch('')
-    setError(null)
     setPromptsError(null)
     if (projectId) void refresh(projectId)
   }, [projectId, refresh])
-
-  useEffect(() => {
-    void (async () => {
-      const settings = await appApi.settings.get()
-      setMissingPlaceholders({
-        characterDetection: getMissingPlaceholders('characterDetection', settings.promptSettings.characterDetection),
-        characterGeneration: getMissingPlaceholders('characterGeneration', settings.promptSettings.characterGeneration)
-      })
-    })()
-  }, [])
-
-  const runDetect = async (options?: { clearScenePrompts?: boolean }): Promise<void> => {
-    if (!projectId) return
-    setError(null)
-    setIsDetecting(true)
-    try {
-      const result = await appApi.characters.detect(projectId, options)
-      setCharacters(result)
-      // A fresh Character Database invalidates any prompts generated for the
-      // old one — CharacterService.detect() now clears character_prompts
-      // server-side too (Phase 12), so this just mirrors that locally.
-      setPrompts([])
-      if (options?.clearScenePrompts) setHasImagePrompts(false)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Character Detection failed.')
-    } finally {
-      setIsDetecting(false)
-    }
-  }
-
-  // spec.md 20 — Regenerate: once characters already exist, re-running
-  // Detect Characters is a destructive replace, so confirm which of the 3
-  // choices the user wants instead of firing immediately. A first-ever
-  // detect (nothing to lose yet) skips the dialog.
-  const onDetectClick = (): void => {
-    if (characters && characters.length > 0) {
-      setShowRegenerateDialog(true)
-      return
-    }
-    void runDetect()
-  }
-
-  const onConfirmRegenerate = (clearScenePrompts: boolean): void => {
-    setShowRegenerateDialog(false)
-    void runDetect({ clearScenePrompts })
-  }
-
-  const onGeneratePrompts = async (): Promise<void> => {
-    if (!projectId) return
-    setPromptsError(null)
-    setIsGenerating(true)
-    try {
-      const result = await appApi.characters.generatePrompts(projectId)
-      setPrompts(result)
-    } catch (err) {
-      setPromptsError(err instanceof Error ? err.message : 'Character Prompt Generation failed.')
-    } finally {
-      setIsGenerating(false)
-    }
-  }
 
   const onRetryPrompt = async (characterId: string): Promise<void> => {
     if (!projectId) return
@@ -194,85 +91,32 @@ export function CharactersPage(): JSX.Element {
     return <div />
   }
 
-  const hasTranscript = (currentProject?.transcript ?? '').trim().length > 0
-  // spec.md 27 — a required placeholder missing from the prompt blocks Run
-  // (this manual trigger stands in for it until Phase 9).
-  const detectBlockedReason = !hasTranscript
-    ? 'Add a transcript first'
-    : missingPlaceholders.characterDetection.length > 0
-      ? `Fix the Character Detection prompt in Settings > Prompts (missing ${missingPlaceholders.characterDetection.join(', ')})`
-      : undefined
-
-  const generateBlockedReason = !characters || characters.length === 0
-    ? 'Detect characters first'
-    : missingPlaceholders.characterGeneration.length > 0
-      ? `Fix the Character Generation prompt in Settings > Prompts (missing ${missingPlaceholders.characterGeneration.join(', ')})`
-      : undefined
-
   return (
     <div>
-      <div className="flex items-start justify-between gap-4 mb-6">
-        <div>
-          <h2 className="font-headline-lg text-headline-lg text-text-primary mb-2">Characters</h2>
-          <p className="font-body-md text-body-md text-text-secondary">
-            Character Database and reference prompts detected from the transcript.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="ghost"
-            type="button"
-            onClick={() => void onGeneratePrompts()}
-            disabled={isGenerating || !!generateBlockedReason}
-            title={generateBlockedReason}
-          >
-            <Wand2 size={14} />
-            {isGenerating ? 'Generating…' : 'Generate Character Prompts'}
-          </Button>
-          <Button
-            variant="primary"
-            type="button"
-            onClick={onDetectClick}
-            disabled={isDetecting || !!detectBlockedReason}
-            title={detectBlockedReason}
-          >
-            {characters && characters.length > 0 ? <RefreshCw size={14} /> : <Sparkles size={14} />}
-            {isDetecting ? 'Detecting…' : characters && characters.length > 0 ? 'Regenerate' : 'Detect Characters'}
-          </Button>
-        </div>
+      <div className="mb-6">
+        <h2 className="font-headline-lg text-headline-lg text-text-primary mb-2">Characters</h2>
+        <p className="font-body-md text-body-md text-text-secondary">
+          Character Database and reference prompts detected from the transcript.
+        </p>
       </div>
 
-      {showRegenerateDialog && (
-        <RegenerateCharactersModal
-          hasImagePrompts={hasImagePrompts}
-          busy={isDetecting}
-          onCancel={() => setShowRegenerateDialog(false)}
-          onConfirm={onConfirmRegenerate}
-        />
-      )}
-
-      {detectBlockedReason && missingPlaceholders.characterDetection.length > 0 && (
-        <p className="mb-2 flex items-center gap-1.5 font-body-sm text-body-sm text-error">
-          <AlertTriangle size={14} />
-          {detectBlockedReason}
-        </p>
-      )}
-      {generateBlockedReason && missingPlaceholders.characterGeneration.length > 0 && (
-        <p className="mb-2 flex items-center gap-1.5 font-body-sm text-body-sm text-error">
-          <AlertTriangle size={14} />
-          {generateBlockedReason}
-        </p>
-      )}
-      {error && <p className="mb-4 font-body-sm text-body-sm text-error">{formatErrorForDisplay(error)}</p>}
       {promptsError && <p className="mb-4 font-body-sm text-body-sm text-error">{formatErrorForDisplay(promptsError)}</p>}
 
       {characters === null ? (
         <p className="font-body-md text-body-md text-text-secondary">Loading…</p>
+      ) : currentProject?.hasCharacters === false ? (
+        // Phase 21 — belt-and-suspenders for direct URL navigation; the
+        // Characters nav item itself is already hidden by Sidebar.tsx.
+        <EmptyState
+          icon={Users}
+          title="This channel doesn't use characters"
+          description="This project's channel is configured without story characters — Character Detection and Character Prompt Generation are skipped."
+        />
       ) : characters.length === 0 ? (
         <EmptyState
           icon={Users}
           title="No characters detected yet"
-          description="Detect Characters analyzes the transcript and builds this list automatically."
+          description="Run All detects characters from the transcript and builds this list automatically."
         />
       ) : (
         <>
@@ -339,7 +183,7 @@ export function CharactersPage(): JSX.Element {
 
                     {!prompt ? (
                       <p className="font-body-sm text-body-sm text-text-secondary italic">
-                        Not generated yet — click &quot;Generate Character Prompts&quot;.
+                        Not generated yet — arrives after Run All generates Character Prompts.
                       </p>
                     ) : prompt.status === 'failed' ? (
                       <div className="flex items-start justify-between gap-3 bg-surface-dim border border-error/40 rounded p-3">
@@ -352,7 +196,8 @@ export function CharactersPage(): JSX.Element {
                           variant="ghost"
                           type="button"
                           onClick={() => void onRetryPrompt(character.characterId)}
-                          disabled={isRetrying}
+                          disabled={isRetrying || isProcessing}
+                          title={isProcessing ? 'Available once the current run finishes or is paused.' : undefined}
                         >
                           <RotateCw size={12} className={isRetrying ? 'animate-spin' : undefined} />
                           {isRetrying ? 'Retrying…' : 'Retry'}

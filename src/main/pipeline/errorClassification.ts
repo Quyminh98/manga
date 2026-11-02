@@ -1,5 +1,5 @@
 import { ErrorCode } from '@shared/enums'
-import { VilaoApiError } from '../services/VilaoService'
+import { LlmApiError } from '../llm/LlmClient'
 import { LlmResponseFormatError } from './errors'
 
 // spec.md 34 — maps whatever a pipeline retry loop actually caught (a Vilao
@@ -54,13 +54,14 @@ export interface ClassifiedError {
 }
 
 export function classifyError(err: unknown): ClassifiedError {
-  if (err instanceof VilaoApiError) {
+  if (err instanceof LlmApiError) {
     const { message, status, apiErrorType, apiErrorCode } = err
 
-    if (message === 'Vilao returned an empty response') return { code: ErrorCode.EMPTY_RESPONSE, message }
+    if (message.endsWith('returned an empty response')) return { code: ErrorCode.EMPTY_RESPONSE, message }
 
     if (status === null) {
-      return message === 'Request timed out'
+      // Phase 28 — timeouts now carry a detail suffix ("… (no data for 180s)").
+      return message.startsWith('Request timed out')
         ? { code: ErrorCode.TIMEOUT, message }
         : { code: ErrorCode.NETWORK_ERROR, message }
     }

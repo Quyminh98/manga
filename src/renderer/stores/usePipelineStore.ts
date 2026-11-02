@@ -25,9 +25,19 @@ interface PipelineState {
 }
 
 let unsubscribeProgress: (() => void) | null = null
+let unsubscribeSceneProgress: (() => void) | null = null
 
+// Uses the side-effect-free projects.get() — NOT projects.open(), which also
+// downgrades a `processing` project straight back to `paused` (ProjectService.open(),
+// meant only for "the app just (re)started and its in-memory run controller
+// is gone"). This function gets called on every live task update *during* an
+// actual run — with open() here, a queue-triggered run of a project whose
+// Processing tab happens to be open would immediately get its own genuine
+// `processing` status clobbered back to `paused`, even though the run is
+// still very much in flight (bug found via a live queue-run screenshot still
+// showing "Paused" next to a "Running" task card).
 async function refreshProjectStatus(projectId: string): Promise<void> {
-  const project = await appApi.projects.open(projectId)
+  const project = await appApi.projects.get(projectId)
   if (project && useProjectStore.getState().currentProject?.id === projectId) {
     useProjectStore.setState({ currentProject: project })
   }
@@ -43,6 +53,7 @@ export const usePipelineStore = create<PipelineState>((set, get) => ({
     if (get().subscribedProjectId === projectId) return
 
     unsubscribeProgress?.()
+    unsubscribeSceneProgress?.()
     set({ subscribedProjectId: projectId, tasks: [], error: null })
 
     void appApi.pipeline.listTasks(projectId).then((tasks) => {
@@ -58,6 +69,27 @@ export const usePipelineStore = create<PipelineState>((set, get) => ({
         else tasks[existingIndex] = task
         return { tasks }
       })
+      // A task update always means this project's status may have changed
+      // too — matters for a *queue*-triggered run of a project whose page
+      // happens to be open: without this, its TopBar/Processing badge would
+      // stay stale (still "Draft"/etc.) until the user navigates away and
+      // back, since only run()/pause()/cancel() (renderer-initiated) used to
+      // trigger this refresh.
+      void refreshProjectStatus(projectId)
+    })
+
+    // pipeline.onProgress above only ever fires for the 3 coarse steps
+    // (SPLIT_SRT/DETECT_CHARACTERS/GENERATE_CHARACTER_PROMPTS) — Scene
+    // Generation, the *last* step, reports progress on a completely separate
+    // channel and never touches pipeline_tasks. Without this, a
+    // queue-triggered run's final PROCESSING → COMPLETED write (which
+    // happens right after Scene Generation's last batch, PipelineService.
+    // runProjectInternal()) never gets picked up here, so TopBar/Processing
+    // keeps showing "Processing…" forever even once every task is done
+    // (found via a finished queue run still showing "Processing…").
+    unsubscribeSceneProgress = appApi.scenePrompts.onProgress(() => {
+      if (get().subscribedProjectId !== projectId) return
+      void refreshProjectStatus(projectId)
     })
   },
 

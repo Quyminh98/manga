@@ -6,12 +6,14 @@ import {
   Users,
   Image,
   Activity,
+  Gauge,
   FolderOutput
 } from 'lucide-react'
 import { useUiStore } from '@renderer/stores/useUiStore'
+import { useProjectStore } from '@renderer/stores/useProjectStore'
 
 // Sidebar nav items per spec.md section 7/8 — Overview, Transcript, SRT,
-// Characters, Image Prompts, Processing, Export. Settings is intentionally
+// Characters, Image Prompts, Processing, API Calls (Phase 27), Export. Settings is intentionally
 // not part of this list (spec.md 9: "Settings là màn riêng"). Paths are
 // relative to the parent `/projects/:projectId` route (router.tsx).
 const NAV_ITEMS = [
@@ -21,6 +23,7 @@ const NAV_ITEMS = [
   { to: 'characters', label: 'Characters', icon: Users },
   { to: 'image-prompts', label: 'Image Prompts', icon: Image },
   { to: 'processing', label: 'Processing', icon: Activity },
+  { to: 'api-calls', label: 'API Calls', icon: Gauge },
   { to: 'export', label: 'Export', icon: FolderOutput }
 ]
 
@@ -31,6 +34,12 @@ const NAV_ITEMS = [
 export function Sidebar(): JSX.Element {
   const isSidebarOpen = useUiStore((state) => state.isSidebarOpen)
   const closeSidebar = useUiStore((state) => state.closeSidebar)
+  // Phase 21 — a project whose channel has hasCharacters=false never runs
+  // Character Detection/Character Prompt Generation, so the Characters tab
+  // has nothing to show; drop it from the nav entirely rather than leaving
+  // it to render an empty state.
+  const hasCharacters = useProjectStore((state) => state.currentProject?.hasCharacters ?? true)
+  const navItems = hasCharacters ? NAV_ITEMS : NAV_ITEMS.filter((item) => item.to !== 'characters')
 
   return (
     <>
@@ -45,14 +54,13 @@ export function Sidebar(): JSX.Element {
       >
         <div className="px-gutter mb-8">
           <h1 className="font-headline-md text-headline-md text-text-primary">StoryPrompt</h1>
-          <p className="font-label-caps text-label-caps text-text-secondary mt-1">AI STRATEGIST</p>
         </div>
 
         <div className="px-4 mb-2">
           <span className="font-label-caps text-label-caps text-text-secondary px-4">PROJECT</span>
         </div>
         <div className="flex-1 overflow-y-auto px-4 space-y-1">
-          {NAV_ITEMS.map(({ to, label, icon: Icon }) => (
+          {navItems.map(({ to, label, icon: Icon }) => (
             <NavLink
               key={to}
               to={to}

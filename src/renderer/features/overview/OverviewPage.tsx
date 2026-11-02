@@ -5,8 +5,10 @@ import { Card } from '@renderer/components/ui/Card'
 import { EmptyState } from '@renderer/components/ui/EmptyState'
 import { appApi } from '@renderer/lib/appApi'
 import { useProjectStore } from '@renderer/stores/useProjectStore'
+import { usePipelineStore } from '@renderer/stores/usePipelineStore'
 import { TaskStatus } from '@shared/enums'
 import type { Character, CharacterPrompt, ScenePrompt, SrtBlock } from '@shared/entities'
+import { formatModelDisplay } from '@shared/llmProviders'
 
 interface MetricCardProps {
   label: string
@@ -46,6 +48,11 @@ function MetricCard({ label, icon: Icon, value, suffix, valueClassName, progress
 export function OverviewPage(): JSX.Element {
   const currentProject = useProjectStore((state) => state.currentProject)
   const projectId = currentProject?.id
+  // Live pipeline state (spec.md 8.1/8.6) — same store TopBar/ProcessingPage
+  // already subscribe to (idempotent re-subscribe, singleton per project),
+  // so this tab reflects a run finishing without needing to navigate away
+  // and back (previously the metrics below were fetched once on mount only).
+  const { subscribe, tasks, isRunning } = usePipelineStore()
 
   const [srtBlocks, setSrtBlocks] = useState<SrtBlock[]>([])
   const [characters, setCharacters] = useState<Character[]>([])
@@ -68,8 +75,41 @@ export function OverviewPage(): JSX.Element {
   }, [])
 
   useEffect(() => {
+    if (!projectId) return
+    subscribe(projectId)
+    void refresh(projectId)
+  }, [projectId, subscribe, refresh])
+
+  // Scene Generation reports progress on its own channel (not through
+  // pipeline_tasks, see usePipelineStore's own comment) — merge each
+  // finished batch's rows in as soon as they land, same pattern as
+  // ProcessingPage/ImagePromptsPage, instead of waiting for a full refetch.
+  useEffect(() => {
+    return appApi.scenePrompts.onProgress((p) => {
+      setScenePrompts((prev) => {
+        const byBlockIndex = new Map(prev.map((sp) => [sp.blockIndex, sp]))
+        for (const sp of p.batchResults) byBlockIndex.set(sp.blockIndex, sp)
+        return Array.from(byBlockIndex.values()).sort((a, b) => a.blockIndex - b.blockIndex)
+      })
+    })
+  }, [])
+
+  // The 3 coarse steps (Split SRT/Detect Characters/Generate Character
+  // Prompts) only push live updates through `tasks`, not a dedicated
+  // per-row channel — refetch characters/character prompts whenever a coarse
+  // step reports progress (a handful of events per run, cheap to refetch
+  // on). Covers both a run started from this renderer and one triggered by
+  // the queue while this tab happens to be open (usePipelineStore.subscribe
+  // pushes `tasks` updates for either case).
+  useEffect(() => {
     if (projectId) void refresh(projectId)
-  }, [projectId, refresh])
+  }, [tasks, projectId, refresh])
+
+  // Final authoritative refresh once a run this renderer itself started
+  // finishes — same safety net as ProcessingPage.
+  useEffect(() => {
+    if (!isRunning && projectId) void refresh(projectId)
+  }, [isRunning, projectId, refresh])
 
   if (!currentProject || !projectId) {
     return <div />
@@ -114,7 +154,7 @@ export function OverviewPage(): JSX.Element {
             <div className="flex items-center gap-2 bg-surface-container-high px-3 py-1.5 rounded-md border border-border-subtle">
               <Cpu size={14} className="text-text-secondary" />
               <span className="font-code-sm text-code-sm text-text-secondary">
-                {currentProject.selectedModelSnapshot ?? currentProject.selectedModel ?? 'No model selected'}
+                {formatModelDisplay(currentProject.selectedModelSnapshot ?? currentProject.selectedModel ?? '') || 'No model selected'}
               </span>
             </div>
           </div>
@@ -127,13 +167,17 @@ export function OverviewPage(): JSX.Element {
               suffix="characters"
             />
             <MetricCard label="SRT" icon={Captions} value={srtBlocks.length.toLocaleString()} suffix="blocks" />
-            <MetricCard label="Characters" icon={Users} value={characters.length.toLocaleString()} suffix="identified" />
-            <MetricCard
-              label="Character Prompt"
-              icon={Sparkles}
-              value={`${characterPromptDone} / ${characters.length}`}
-              progressPercent={characterPromptPercent}
-            />
+            {currentProject.hasCharacters && (
+              <>
+                <MetricCard label="Characters" icon={Users} value={characters.length.toLocaleString()} suffix="identified" />
+                <MetricCard
+                  label="Character Prompt"
+                  icon={Sparkles}
+                  value={`${characterPromptDone} / ${characters.length}`}
+                  progressPercent={characterPromptPercent}
+                />
+              </>
+            )}
             <MetricCard
               label="Image Prompt"
               icon={ImageIcon}

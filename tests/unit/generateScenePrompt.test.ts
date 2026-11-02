@@ -374,6 +374,17 @@ describe('parseSceneGenerationResponse', () => {
     expect(result.get(3)).toBe('Third scene.')
   })
 
+  it('collapses newlines the model still emits inside a prompt into single spaces (spec.md 30 rule 10)', () => {
+    const content = JSON.stringify({
+      scene_prompts: [
+        { block_number: 1, prompt: 'Panel 1 (top, wide): a hero stands tall.\n\nPanel 2 (bottom, small): rain falls.  --ar 16:9' }
+      ]
+    })
+    expect(parseSceneGenerationResponse(content, [1]).get(1)).toBe(
+      'Panel 1 (top, wide): a hero stands tall. Panel 2 (bottom, small): rain falls. --ar 16:9'
+    )
+  })
+
   it('repairs a response wrapped in a markdown code fence', () => {
     const wrapped = '```json\n' + threeSceneResponse + '\n```'
     expect(parseSceneGenerationResponse(wrapped, [1, 2, 3]).size).toBe(3)

@@ -1,5 +1,30 @@
-import type { Character, CharacterPrompt, ModelInfo, PipelineTask, Project, ScenePrompt, SrtBlock } from './entities'
+import type { Channel, Character, CharacterPrompt, LlmCall, ModelInfo, PipelineTask, Project, ScenePrompt, SrtBlock } from './entities'
 import type { VilaoConnectionStatus } from './enums'
+import type { LlmProvider } from './llmProviders'
+
+// Phase 27 — per-project LLM call statistics (API Calls tab).
+export interface LlmCallGroup {
+  key: string
+  calls: number
+  failed: number
+  durationMs: number
+  totalTokens: number
+}
+
+export interface LlmCallStats {
+  totalCalls: number
+  successCalls: number
+  failedCalls: number
+  totalDurationMs: number
+  // Sums of what the provider reported; 0 when it reported nothing.
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  byStep: LlmCallGroup[]
+  byModel: LlmCallGroup[]
+  // Newest first, capped (200).
+  recent: LlmCall[]
+}
 
 // Typed surface for window.appApi (contextBridge). Renderer never touches the
 // Vilao API key or calls Vilao directly — everything here is IPC to Main.
@@ -7,19 +32,30 @@ import type { VilaoConnectionStatus } from './enums'
 // no-op or reject with NOT_IMPLEMENTED; wired to real logic from Phase 2 on.
 
 export interface AppSettings {
-  maxCharacters: number
+  // "Average", not a hard ceiling (Phase 18, user request) — see
+  // splitSrt.ts's gatherBlocks(). Now the default template used when
+  // creating a new Channel (Settings > General), not a project directly.
+  avgCharacters: number
+  variancePercent: number
   fakeSrtDurationSec: number
   selectedModel: string | null
   promptSettings: {
     characterDetection: string
     characterGeneration: string
     sceneGeneration: string
+    // Phase 22 — default template seeded into a new channel's
+    // sceneGenerationPromptNoCharacters (Channel.hasCharacters=false).
+    sceneGenerationNoCharacters: string
   }
   uiPreferences: Record<string, unknown>
+  // Doubles as the configured "Default Export Folder" (Settings > General) —
+  // export.project() uses it directly with no folder-picker dialog once set;
+  // the dialog only appears the first time, to establish it (see spec.md 21).
   lastExportFolder: string | null
 }
 
 export interface ProjectSummary extends Project {
+  channelName: string
   srtCount: number
   characterCount: number
   characterPromptDone: number
@@ -27,6 +63,29 @@ export interface ProjectSummary extends Project {
   failedTaskCount: number
   progressPercent: number
 }
+
+// Run queue (queue.ipc.ts/QueueService) — in-memory only, does not persist
+// across an app restart. `running` is always at most one item (queue.list()
+// puts it first); everything after it is `queued`, in FIFO run order.
+export interface QueueItem {
+  projectId: string
+  projectName: string
+  status: 'queued' | 'running'
+}
+
+// Machine-locked activation (Phase 23) — whole-install state, not per-project
+// data, so it lives in a flat userData file (ActivationService), not SQLite.
+// getStatus() re-verifies the stored code's signature against the CURRENT
+// machine's ID every call, so copying the record to another machine doesn't
+// help: `corrupt` = the record file is unreadable/malformed, `invalid_for_machine`
+// = the record is well-formed but its signature doesn't match this machine.
+export type ActivationStatus =
+  | { activated: true }
+  | { activated: false; reason: 'not_activated' | 'corrupt' | 'invalid_for_machine' }
+
+export type ActivationResult =
+  | { success: true }
+  | { success: false; reason: 'invalid_format' | 'verification_failed' }
 
 // Emitted by scenePrompts.generate() after each batch (spec.md 17 — batches
 // of SCENE_PROMPT_BATCH_SIZE, default 10) finishes, success or failed, so the
@@ -46,8 +105,23 @@ export interface ScenePromptGenerationProgress {
 
 export interface AppApi {
   projects: {
-    create(input: { name: string; transcript: string }): Promise<Project>
+    // channelId is required (Phase 18) — every project belongs to exactly
+    // one channel, chosen once at creation and never changed afterward. The
+    // channel's current settings (avgCharacters/variancePercent/
+    // fakeDurationSec/model/3 prompts/sceneConcurrency/sceneBatchSize) are copied into this
+    // project's own columns at this moment, same copy-once pattern
+    // AppSettings → project used before channels existed (see
+    // ProjectService.create).
+    create(input: { name: string; transcript: string; channelId: string }): Promise<Project>
     open(id: string): Promise<Project | null>
+    // Plain read, no side effects (unlike open(), which bumps last_opened_at
+    // and downgrades a stuck `processing` status back to `paused` — correct
+    // only for a fresh navigation/app start, not for polling the status of a
+    // project that's genuinely running right now). usePipelineStore's
+    // per-task refresh uses this instead of open() so a live queue-triggered
+    // run doesn't get its own `processing` status clobbered back to `paused`
+    // mid-run just because its Processing tab happens to be open.
+    get(id: string): Promise<Project | null>
     list(): Promise<ProjectSummary[]>
     rename(id: string, name: string): Promise<void>
     delete(id: string): Promise<void>
@@ -58,9 +132,13 @@ export interface AppApi {
     // Renderer never gets filesystem access (spec.md 4.1).
     loadTranscriptFile(): Promise<string | null>
     // Phase 9 — Settings > Advanced > Pipeline Tuning writes directly to the
-    // currently open project (maxRetry/sceneConcurrency are per-project
-    // schema.md fields, not AppSettings; see plan.md Phase 4/9 notes).
-    updatePipelineSettings(id: string, settings: { maxRetry: number; sceneConcurrency: number }): Promise<Project>
+    // currently open project (maxRetry/sceneConcurrency/sceneBatchSize are
+    // per-project schema.md fields, not AppSettings; see plan.md Phase 4/9
+    // notes). sceneBatchSize added 2026-08-10 (user request).
+    updatePipelineSettings(
+      id: string,
+      settings: { maxRetry: number; sceneConcurrency: number; sceneBatchSize: number }
+    ): Promise<Project>
   }
   srt: {
     list(projectId: string): Promise<SrtBlock[]>
@@ -117,11 +195,23 @@ export interface AppApi {
   settings: {
     get(): Promise<AppSettings>
     save(settings: Partial<AppSettings>): Promise<AppSettings>
+    // Opens a native folder picker and persists the pick as
+    // AppSettings.lastExportFolder. Returns null if the user cancels.
+    chooseExportFolder(): Promise<string | null>
   }
-  vilao: {
-    saveApiKey(apiKey: string): Promise<void>
-    testConnection(): Promise<VilaoConnectionStatus>
-    listModels(): Promise<ModelInfo[]>
+  // Phase 27 — per-project LLM call counts for the "API Calls" tab.
+  llmCalls: {
+    stats(projectId: string): Promise<LlmCallStats>
+    // Fires (with the project id) after every logged call; returns an unsubscribe function.
+    onChanged(callback: (projectId: string) => void): () => void
+  }
+  // Phase 25 — replaces the Vilao-only `vilao` domain: every method takes the
+  // provider (Vilao/DeepSeek/Gemini). listModels returns ids already in
+  // channel format ("deepseek:deepseek-chat"; bare for Vilao).
+  providers: {
+    saveApiKey(provider: LlmProvider, apiKey: string): Promise<void>
+    testConnection(provider: LlmProvider): Promise<VilaoConnectionStatus>
+    listModels(provider: LlmProvider): Promise<ModelInfo[]>
     // Cheap local existence check (no decrypt, no network) — lets the UI show
     // "a key is already saved" without ever reading the key itself back into
     // the Renderer. Added after Phase 3 shipped: clearing the API key input
@@ -129,28 +219,62 @@ export interface AppApi {
     // the key had been lost, since the input fell back to its generic
     // "sk-vilao-…" example placeholder with no way to tell configured apart
     // from empty.
-    hasApiKey(): Promise<boolean>
+    hasApiKey(provider: LlmProvider): Promise<boolean>
     // Deletes the stored credential file outright (SecureStorageService.clear(),
     // already used internally since Phase 3, just not exposed over IPC until
     // now) — the explicit "Remove" action for the disabled/saved input state.
-    clearApiKey(): Promise<void>
+    clearApiKey(provider: LlmProvider): Promise<void>
   }
   export: {
-    // Opens a native "choose folder" dialog in Main (same pattern as
-    // projects.loadTranscriptFile), writes Project_Name/{Project_Name.srt,
-    // character_prompts.txt, image_prompts.txt} into the chosen directory
-    // (ExportService, spec.md 21-24), and remembers the chosen parent folder
-    // as AppSettings.lastExportFolder for next time. Rejects with the
-    // literal message "EXPORT_CANCELED" if the user dismisses the dialog —
-    // the Renderer treats that as a silent no-op, not an error toast.
-    project(projectId: string): Promise<{ folderPath: string }>
-    // Reveals an already-exported folder in Finder — takes the exact
-    // `folderPath` this same session got back from project() above, not an
-    // arbitrary Renderer-supplied path. Not in spec.md 4.2's original list,
-    // added in Phase 11 for the "Show in Finder" button that appears after a
-    // successful export (spec.md 8.7) — projects.showInFinder always points
-    // at the SQLite DB file (see its own comment), not a per-project folder.
+    // Where Project_Name/{Project_Name.srt, character_prompts.txt,
+    // image_prompts.txt} was (or will be) written — join of
+    // AppSettings.lastExportFolder ("Default Export Folder", Settings >
+    // General) and the sanitized project name. Null if that folder hasn't
+    // been configured yet. The actual write now happens automatically in
+    // Main (PipelineService) when Run All completes, not from the Renderer.
+    getFolderPath(projectId: string): Promise<string | null>
+    // Reveals that folder in Finder. Not in spec.md 4.2's original list,
+    // added in Phase 11 for the Export tab's "Show in Finder" button —
+    // projects.showInFinder always points at the SQLite DB file (see its own
+    // comment), not a per-project folder.
     showInFinder(folderPath: string): Promise<void>
+  }
+  // Run queue — adds projects one at a time via a per-project "Add to Queue"
+  // action; QueueService (Main) runs them strictly in FIFO order, one at a
+  // time, starting the next the instant the previous settles (success or
+  // failure never stops the queue). In-memory only.
+  queue: {
+    add(projectId: string): Promise<void>
+    // No-op (returns normally) if projectId isn't currently a *queued* item
+    // — the running one can't be removed this way.
+    remove(projectId: string): Promise<void>
+    list(): Promise<QueueItem[]>
+    // Fires with the full current list on every add/remove/start/finish.
+    onUpdate(callback: (items: QueueItem[]) => void): () => void
+  }
+  // Phase 18 — Channels: shared, editable settings template a project copies
+  // from once at creation time (see projects.create above). Settings >
+  // General/Prompts (settings.get/save) now serve as the *default* template
+  // for a newly created channel, not for a newly created project directly.
+  channels: {
+    list(): Promise<Array<Channel & { projectCount: number }>>
+    get(id: string): Promise<Channel | null>
+    create(input: Omit<Channel, 'id' | 'createdAt' | 'updatedAt'>): Promise<Channel>
+    update(id: string, input: Omit<Channel, 'id' | 'createdAt' | 'updatedAt'>): Promise<Channel>
+    // Rejects if the channel still has projects, or if it's the last
+    // remaining channel (New Project always needs at least one to pick
+    // from) — see ChannelService.delete.
+    delete(id: string): Promise<void>
+  }
+  // Phase 23 — machine-locked activation gate, checked once by App.tsx before
+  // it renders RouterProvider. Offline: codes are Ed25519 signatures over
+  // this machine's ID, produced out-of-band by the developer's own CLI
+  // (scripts/generate-activation-code.cjs) and verified locally against a
+  // hardcoded public key — no server, no network call.
+  activation: {
+    getMachineId(): Promise<string>
+    getStatus(): Promise<ActivationStatus>
+    activate(code: string): Promise<ActivationResult>
   }
 }
 
